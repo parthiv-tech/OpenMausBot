@@ -1,10 +1,12 @@
 // OpenMausBot server — the harness host. Clients hold no transports
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
+import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, unlinkSync, utimesSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { extname, join } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { z } from "zod";
 import { botAvatarUrlFromStoredPath } from "../shared/bot-avatar.ts";
@@ -124,6 +126,7 @@ import {
   EVENTS_DIR,
   NATIVE_DIR,
   customMcpServers,
+  selfModifyEnabled,
 } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { MAX_REMOTE_COMMAND_LENGTH } from "./remote-computer.ts";
@@ -142,6 +145,7 @@ import {
   type ModelSelection,
   type RequestOutcome,
   type RuntimeEvent,
+  type TurnStartResult,
   newId,
 } from "./contracts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
@@ -280,7 +284,23 @@ import {
   stageSkillWrite,
 } from "./skills.ts";
 import { fetchSkillFromSource } from "./skill-fetch.ts";
+import { BUILT_IN_PRESETS, fetchPromptsFromSource, presetWire, PROMPT_COLLECTIONS } from "./prompt-presets.ts";
+import { distillPrompts, META_SOURCE_PREFIX } from "./prompt-distill.ts";
+import {
+  applyPending,
+  discardPending,
+  failStartupCheck,
+  listJournal,
+  listPending,
+  markProposalForBoot,
+  reconcileAbandonedProposals,
+  revertProposal,
+  verifyBootedProposal,
+  writeJournal,
+  type JournalEntry,
+} from "./self-modify.ts";
 import { expandLearnTurnText, learnSource } from "./skill-learn.ts";
+import { buildApiToolbox } from "./api-toolbox.ts";
 import { expandSetupTurnText, setupModeActive, setupSystemPrompt } from "./setup-mode.ts";
 import type { SkillRequestCardData } from "../shared/skill-request.ts";
 import { checkSoulDrift, readSoulDrift, soulFile, writeSoulMirror } from "./bot-folder.ts";
@@ -454,6 +474,81 @@ let companionMutationToken: string | undefined = DESKTOP_MANAGED ? "" : undefine
 // Where remote clients reach this server (a proxy's public address); pairing URLs use it.
 const FALLBACK_PUBLIC_URL = process.env.OMB_PUBLIC_URL?.trim().replace(/\/+$/, "") || null;
 const cfg = loadConfig();
+
+// ── self-modify trial boot ───────────────────────────────────────
+// Disk may hold an `applied` proposal from a previous run (a runtime apply
+// keeps the old code in memory; the NEXT boot is the trial). This runs as
+// early as possible so the marker + detached watchdog cover the whole
+// risky window: if THIS boot cannot parse, initialize, or bind — the
+// watchdog reverts; if it dies in a handled failure below,
+// failStartupCheck reverts; if it serves, the listener callback verifies.
+if (selfModifyEnabled(cfg)) {
+  const pendingTrial = listJournal().find((entry) => entry.status === "applied");
+  if (pendingTrial) {
+    markProposalForBoot(pendingTrial);
+    spawnDetachedSelfModifyWatchdog(pendingTrial);
+    console.log(`self-modify: trial boot for "${pendingTrial.proposal.id}" — reverting on crash, wedge, or failed boot`);
+  }
+  const abandoned = reconcileAbandonedProposals();
+  for (const id of abandoned) console.log(`self-modify: reverted unverified proposal "${id}" from a previous run`);
+  // Heartbeat: the watchdog reads the marker's mtime; a stalled mtime with
+  // a live pid means the event loop wedged. Best-effort by design.
+  const selfModifyHeartbeat = setInterval(() => {
+    try {
+      const marker = join(DATA_DIR, "self-modify", "boot-marker.json");
+      if (existsSync(marker)) utimesSync(marker, new Date(), new Date());
+    } catch {
+      // a missed beat is not fatal; staleness is judged over 60s
+    }
+  }, 15_000);
+  selfModifyHeartbeat.unref();
+}
+
+/** Spawn the detached stability watchdog for a trial boot. Detached +
+ * unref'd: it must outlive this process even if this process is killed
+ * -9, and it must never hold the event loop open. */
+function spawnDetachedSelfModifyWatchdog(entry: JournalEntry): void {
+  try {
+    const script = join(resolve(dirname(fileURLToPath(import.meta.url)), ".."), "electron", "self-modify-watchdog.mjs");
+    if (!existsSync(script)) {
+      console.warn("self-modify: watchdog script missing — trial boot runs without a crash watcher");
+      return;
+    }
+    const journalFile = join(DATA_DIR, "self-modify", "journal", `${entry.proposal.id}.json`);
+    const child = spawn(
+      process.execPath,
+      [script, journalFile, DATA_DIR, String(process.pid), resolve(dirname(fileURLToPath(import.meta.url)), "..")],
+      { detached: true, stdio: "ignore", windowsHide: true },
+    );
+    child.unref();
+  } catch (error) {
+    console.warn(`self-modify: could not spawn watchdog: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// A boot failure under a live proposal must leave the originals restored.
+// The guard is installed only for the trial window and removed once the
+// listener verifies — the server's own crash semantics are untouched
+// afterward. The rethrow lands on the next tick so the revert completes
+// before the process dies with its original stack.
+let selfModifyBootGuard: ((error: Error) => void) | null = null;
+if (selfModifyEnabled(cfg) && listJournal().some((entry) => entry.status === "applied")) {
+  selfModifyBootGuard = (error: Error) => {
+    process.off("uncaughtException", selfModifyBootGuard!);
+    selfModifyBootGuard = null;
+    try {
+      failStartupCheck(`boot crashed before serving: ${error.message}`);
+      console.error(`self-modify: boot crashed with the proposal applied — originals restored; re-crashing`, error);
+    } catch (revertError) {
+      console.error(`self-modify: boot-crash revert failed: ${revertError instanceof Error ? revertError.message : String(revertError)}`);
+    }
+    setImmediate(() => {
+      throw error;
+    });
+  };
+  process.on("uncaughtException", selfModifyBootGuard);
+}
+
 const customDomainVerifier = createCustomDomainVerifier({ environmentId: ENVIRONMENT_ID });
 // "Sign in with your email" on /pair: the allow-list is read per call so a
 // Settings change or an env bootstrap applies without a restart.
@@ -4646,7 +4741,11 @@ async function startTurn(
     rewound,
     fresh,
     externallyUpdated: Boolean(externalContextMarker),
-    replaysNatively: instance.driverKind === "grok",
+    // grok and vision are transcript-replay drivers: history rides
+    // SendTurnInput.transcript (vision's RLM harness then exposes it to the
+    // model only as sandbox data), so the turn text is never wrapped with a
+    // replay block.
+    replaysNatively: instance.driverKind === "grok" || instance.driverKind === "vision",
   });
   // Snapshot the cursor alongside the context decision. An external result
   // can arrive during async computer/setup work and clear the task cursor;
@@ -4794,8 +4893,11 @@ async function startTurn(
       // Explicit destinations are strict. In particular, Local VM must never
       // fall through to host CUA and accidentally click on the user's Mac.
       if (wants === "vm") {
-        if (!mountsComputerMcp || instance.driverKind === "boxAgent") {
-          throw new Error("this model engine cannot use the Local VM — choose Claude or an ACP engine, or select another computer destination");
+        // computerMcp is advertised by CLI drivers that mount the MCP server
+        // themselves AND by API drivers with the harness tool loop (the
+        // toolbox below executes the same container MCP server for them).
+        if ((!mountsComputerMcp && instance.adapter.capabilities.apiToolLoop !== true) || instance.driverKind === "boxAgent") {
+          throw new Error("this model engine cannot use the Local VM — choose Claude, an ACP engine, or an API engine with the tool loop, or select another computer destination");
         }
         const localVmTarget = localVmTargetForBot(bot.id);
         bindTurnComputer(resourceOwner, `computer:vm:${localVmTarget.key}`, true);
@@ -4839,12 +4941,14 @@ async function startTurn(
           return containerComputerFrame(undefined, undefined, localVmTarget);
         };
       } else if (wants === "local") {
+        const apiToolLoopLocal = instance.adapter.capabilities.apiToolLoop === true &&
+          instance.adapter.capabilities.localComputerMcp === true;
         if (!shouldMountLocalComputer({
           requested: "local",
           hostPlatform: process.platform,
           providerSupportsLocal: mountsLocalComputer,
-        })) {
-          throw new Error("this model engine cannot control this computer — choose Claude or an ACP engine, or select another destination");
+        }) && !apiToolLoopLocal) {
+          throw new Error("this model engine cannot control this computer — choose Claude, an ACP engine, or an API engine with the tool loop, or select another destination");
         }
         const cua = readCuaConnection();
         if (!cua) throw new Error("CUA Driver is not ready for this computer — check permissions and restart OpenMausBot");
@@ -5067,6 +5171,24 @@ async function startTurn(
           browserCapture = () => browserRuntime.withAgentAction(session, () => agentBrowserFrame(frame));
         }
       }
+      // API-driven engines have no agent process to mount MCP servers — the
+      // harness is the host instead. When this turn mounted tool surfaces
+      // (computer/browser/phone/custom), spawn their MCP servers now and hand
+      // the shared runtime a ready-to-call toolbox; the runtime closes it when
+      // the turn settles. CLI engines keep their native mounting and receive
+      // `tools` never — their capabilities don't claim apiToolLoop.
+      // Built AFTER the browser mount above: buildApiToolbox snapshots
+      // `integrations`, so a browser mounted after the build would silently
+      // contribute no tools to this turn.
+      let turnToolbox: Awaited<ReturnType<typeof buildApiToolbox>> | null = null;
+      if (instance.adapter.capabilities.apiToolLoop === true) {
+        turnToolbox = await buildApiToolbox(integrations as Parameters<typeof buildApiToolbox>[0]);
+        if (turnToolbox.toolListProblems.length > 0) {
+          for (const problem of turnToolbox.toolListProblems) {
+            console.warn(`api-tools: ${problem}`);
+          }
+        }
+      }
       // A cancelled adapter can be between accepting sendTurn and revealing
       // its provider turn id. Never overlap a replacement with that ambiguous
       // pre-id window: wait for the old handshake to settle or for its bounded
@@ -5113,30 +5235,48 @@ async function startTurn(
         { id: "webhook", label: "Webhook provenance", text: opts?.automationSource === "webhook" ? WEBHOOK_PROMPT : "" },
         { id: "mentions", label: "Mentions", text: mentionPrompt(tagged) },
       ]);
-      const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
-        threadId,
-        text: turnText,
-        images: turnImages,
-        approvalMode: approvalModeForTurn(bot, commsDepth > 0),
-        model,
-        effort,
-        // a rewound thread never resumes the abandoned branch's session
-        // the active task's own session — another task's cursor would
-        // resume the wrong conversation and defeat the context bubble
-        resumeCursor,
-        ...(recoveryText !== undefined ? { recoveryText } : {}),
-        transcript,
-        system: prompt.text,
-        systemStable: prompt.stable,
-        systemVolatile: prompt.volatile,
-        integrations,
-        cwd,
-      }), () => !directTurnClaimExists(bot.id, dispatchClaimId, threadId), async () => {
-        await instance.adapter.interruptTurn(threadId).catch(() => {});
-      });
+      let dispatch: { value: TurnStartResult; cancelled: boolean };
+      try {
+        dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
+          threadId,
+          text: turnText,
+          images: turnImages,
+          ...(turnToolbox && turnToolbox.tools.length > 0 ? { tools: { list: turnToolbox.tools, close: turnToolbox.close } } : {}),
+          approvalMode: approvalModeForTurn(bot, commsDepth > 0),
+          model,
+          effort,
+          // a rewound thread never resumes the abandoned branch's session
+          // the active task's own session — another task's cursor would
+          // resume the wrong conversation and defeat the context bubble
+          resumeCursor,
+          ...(recoveryText !== undefined ? { recoveryText } : {}),
+          transcript,
+          system: prompt.text,
+          systemStable: prompt.stable,
+          systemVolatile: prompt.volatile,
+          integrations,
+          cwd,
+        }), () => !directTurnClaimExists(bot.id, dispatchClaimId, threadId), async () => {
+          await instance.adapter.interruptTurn(threadId).catch(() => {});
+        });
+      } catch (error) {
+        // sendTurn refused synchronously (already-running turn, missing key):
+        // the toolbox was never accepted, so its spawned servers are ours to
+        // close before the error propagates.
+        if (turnToolbox) await turnToolbox.close().catch(() => {});
+        throw error;
+      }
       if (dispatch.cancelled) {
         retireProviderTurn(dispatch.value.turnId);
         throw new DirectTurnSetupCancelled("turn stopped during provider setup");
+      }
+      // Ownership moved: sendTurn accepted the toolbox (the runtime's finally
+      // closes it), unless it was dropped because the turn mounted no tools —
+      // then close it here instead of leaking the spawned servers.
+      if (turnToolbox && turnToolbox.tools.length > 0) turnToolbox = null;
+      else if (turnToolbox) {
+        await turnToolbox.close().catch(() => {});
+        turnToolbox = null;
       }
       bindInternalCapabilityToProviderTurn(threadId, dispatchClaimId, dispatch.value.turnId);
       if (directFollowupSettlers.has(dispatchClaimId) && dispatch.value.turnId &&
@@ -8160,6 +8300,7 @@ function configStatus() {
     billing: { currency: cfg.billing?.currency ?? "USD", prices: cfg.billing?.prices ?? {} },
     // the base URL is a setting, not a secret; the key stays write-only
     openaiCompat: { configured: Boolean(cfg.openaiCompat?.key), url: cfg.openaiCompat?.url ?? "" },
+    vision: { configured: Boolean(cfg.vision?.key), url: cfg.vision?.url ?? "" },
     composio: {
       configured: composio.configured(cfg),
       mode: composio.connectionMode(cfg),
@@ -8169,6 +8310,7 @@ function configStatus() {
     opencodeGo: { configured: Boolean(cfg.opencodeGo?.apiKey) },
     // the chosen voice is a setting, not a secret; the key is reported the
     // same configured-or-not way as every other credential
+    dictation: { configured: Boolean(cfg.dictation?.key) },
     tts: tts.describeVoice(cfg),
     imageGen: avatarImageStatus(cfg),
     // not a secret — the sidebar shows it
@@ -8185,6 +8327,7 @@ function configStatus() {
       skillAuthoring: skillAuthoringEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
       browser: builtInBrowserEnabled(cfg),
+      selfModify: selfModifyEnabled(cfg),
     },
     // first-run progress — not a secret; the app decides whether to show
     // the welcome tour from this, never from browser storage
@@ -12283,7 +12426,44 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, { ok: true });
     }
 
-    // ── section context: a user-owned team brief ────────────────────────
+    // ── prompt library: read-only catalog, built-ins + GitHub import ────
+    // Read-only on purpose: applying a preset goes through the normal bot
+    // patch (soul cap, history, drift all keep single ownership), so this
+    // endpoint only ever lists. Import mirrors skill imports' GitHub-only,
+    // bounded-fetch policy. See server/prompt-presets.ts.
+    m = path.match(/^\/api\/prompt-library(\/.*)?$/);
+    if (m && method === "GET") {
+      if (m[1]) {
+        const source = decodeURIComponent(m[1].slice(1));
+        if (!source) return json(res, 400, { error: "source must not be empty" });
+        // `meta:<source>` distills: fetch the prompts verbatim, then have an
+        // available engine reduce each one to vendor-neutral principles.
+        // Results are cached by source content (server/prompt-distill.ts);
+        // one prompt's failure is one error line, never the batch's.
+        const metaRequested = source.startsWith(META_SOURCE_PREFIX);
+        const fetched = await fetchPromptsFromSource(metaRequested ? source.slice(META_SOURCE_PREFIX.length) : source);
+        if ("error" in fetched) return json(res, 422, { error: fetched.error });
+        if (metaRequested) {
+          const complete = async (prompt: string): Promise<string> => {
+            for (const candidate of registry.instances()) {
+              if (typeof candidate.generateText !== "function") continue;
+              try {
+                const snapshot = await candidate.snapshot();
+                if (snapshot.state !== "available") continue;
+                return await candidate.generateText(prompt);
+              } catch {
+                continue; // a dead engine is the next engine's turn
+              }
+            }
+            throw new Error("no available engine to distill with — connect an engine first, or import without the meta: prefix");
+          };
+          const distilled = await distillPrompts(fetched.presets, complete);
+          return json(res, 200, { presets: distilled.presets.map(presetWire), errors: [...fetched.errors, ...distilled.errors] });
+        }
+        return json(res, 200, { presets: fetched.presets.map(presetWire), errors: fetched.errors });
+      }
+      return json(res, 200, { presets: BUILT_IN_PRESETS.map(presetWire), collections: PROMPT_COLLECTIONS });
+    }
     // Bots receive this in their system context, but no agent tool can write
     // it. That keeps one bot from silently changing every teammate's future
     // turns. The section query parameter is required even for General (""),
@@ -13915,6 +14095,71 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
 
+    // ── self-modify: journal + pending inbox (admin scope) ──────────
+    // The gate is read per request so toggling the feature takes effect
+    // without a restart. Every mutation requires admin; applying runs the
+    // journal-first + preflight + trial-boot pipeline from self-modify.ts.
+    if (path === "/api/self-modify" || path.startsWith("/api/self-modify/")) {
+      if (!selfModifyEnabled(cfg)) return json(res, 403, { error: "self-modify is disabled — set features.selfModify or OMB_SELF_MODIFY=1" });
+      if (!auth.scopes.includes("admin")) return json(res, 403, { error: "admin scope required" });
+
+      if (method === "GET" && path === "/api/self-modify") {
+        return json(res, 200, {
+          journal: listJournal().map((entry) => ({
+            id: entry.proposal.id,
+            proposedBy: entry.proposal.proposedBy,
+            reason: entry.proposal.reason,
+            status: entry.status,
+            appliedAt: entry.appliedAt,
+            verifiedAt: entry.verifiedAt ?? null,
+            revertedAt: entry.revertedAt ?? null,
+            revertReason: entry.revertReason ?? null,
+            files: entry.proposal.files.map((f) => f.path),
+            checks: entry.checks ?? [],
+          })),
+          pending: listPending(),
+          enabled: true,
+        });
+      }
+
+      const mSelf = path.match(/^\/api\/self-modify\/([a-zA-Z0-9._-]{1,64})$/);
+      if (mSelf && method === "GET") {
+        const entry = listJournal().find((candidate) => candidate.proposal.id === mSelf[1]);
+        if (!entry) return json(res, 404, { error: "no journal entry with that id" });
+        return json(res, 200, { entry });
+        }
+
+      if (mSelf && method === "POST") {
+        // action is in the body: apply | revert | verify | discard
+        const body = await readBody(req);
+        const action = typeof body?.action === "string" ? body.action : "";
+        const id = mSelf[1]!;
+        if (action === "apply") {
+          const result = applyPending(id);
+          return json(res, result.ok ? 200 : 422, result);
+        }
+        const entry = listJournal().find((candidate) => candidate.proposal.id === id);
+        if (action === "revert" && entry) {
+          const reverted = revertProposal(entry, "reverted by operator");
+          writeJournal(reverted);
+          return json(res, 200, { entry: reverted });
+        }
+        if (action === "verify" && entry) {
+          if (entry.proposal.files.some((f) => f.path.startsWith("server/") || f.path.startsWith("shared/")) || entry.proposal.packageJson) {
+            return json(res, 409, { error: "server-touching proposals are verified by a trial boot, not by hand" });
+            }
+          const verified = { ...entry, status: "verified" as const, verifiedAt: new Date().toISOString() };
+          writeJournal(verified);
+          return json(res, 200, { entry: verified });
+        }
+        if (action === "discard") {
+          const removed = discardPending(id);
+          return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: "no pending proposal with that id" });
+        }
+        return json(res, 400, { error: "action must be apply | revert | verify | discard" });
+      }
+    }
+
     // ── app config (API keys — never echoed back, booleans only) ──
     if (method === "GET" && path === "/api/config") {
       return json(res, 200, configForAccess(configStatus(), auth.scopes.includes("admin")));
@@ -13931,6 +14176,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       const disablingBuiltInBrowser = patch.features?.browser === false && builtInBrowserEnabled(cfg);
+      // Turning self-modify off must not leave an unverified proposal on
+      // disk: the trial-boot machinery would not run to judge it.
+      const disablingSelfModify = patch.features?.selfModify === false && selfModifyEnabled(cfg);
       const removedBrowserProfileIds = patch.browserProfiles === undefined
         ? []
         : (cfg.browserProfiles ?? [])
@@ -14238,6 +14486,14 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       let browserReferenceCleanupError: unknown = null;
       if (disablingBuiltInBrowser) browserLive.closeAll();
+      if (disablingSelfModify) {
+        for (const entry of listJournal()) {
+          if (entry.status !== "applied") continue;
+          const reverted = revertProposal(entry, "self-modify disabled while the proposal was unverified");
+          writeJournal(reverted);
+          console.log(`self-modify: reverted "${entry.proposal.id}" — feature disabled`);
+        }
+      }
       for (const request of browserCleanupRequests) {
         if (request.kind === "profile") browserLive.closeForSession(browserSessionId("", request.partitionId));
       }
@@ -14772,6 +15028,19 @@ restoreChannelMessages();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+  // The trial boot survived parse, module init, and listener bind: the
+  // riskiest window is behind us, so the live proposal is promoted and the
+  // boot-crash guard comes off.
+  try {
+    const verified = verifyBootedProposal();
+    if (verified) console.log(`self-modify: trial boot verified "${verified.proposal.id}"`);
+  } catch (error) {
+    console.warn(`self-modify: verify failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (selfModifyBootGuard) {
+    process.off("uncaughtException", selfModifyBootGuard);
+    selfModifyBootGuard = null;
+  }
   followupsReady = true;
   drainQueuedSends();
   drainQueuedChannelSends();
