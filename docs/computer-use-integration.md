@@ -1,6 +1,6 @@
-# Computer use & browser use in OpenMausBot
+# Computer use & browser use in Astra
 
-Decision doc, 2026-08-12. How bots in OpenMausBot get local computer use and
+Decision doc, 2026-08-12. How bots in Astra get local computer use and
 browser use. macOS and packaged Ubuntu x64 builds use an out-of-the-box,
 release-pinned provider; source/dev Ubuntu may use a separately installed provider. Based
 on a survey of OSS chat-app MCP hosts, macOS control servers,
@@ -24,11 +24,13 @@ Electron main process
   servers get injected into each bot's `--mcp-config`. Same pattern as Claude
   Desktop / Cherry Studio / LibreChat.
 - **Local desktop use = `cua-driver`**. macOS packages the Rust Mach-O in app
-  Resources; Ubuntu x64 packages the certified 0.19.3 ELF plus its cursor-theme
-  sidecar outside ASAR. Both remain paired with the application release. This
-  applies to the Ubuntu 24.04 GNOME/Xorg beta and guarded GNOME/Wayland beta;
-  remote/cloud boxes and the isolated Local VM remain separate providers.
-  NOT Swift — the Swift file everyone remembers
+  Resources; Windows packages the checksummed x64 exe plus the SDK dll outside
+  ASAR (`pnpm build:cua:win`, proven per-build by `smoke:cua-win` on the
+  windows-latest CI leg); Ubuntu x64 packages the certified 0.19.3 ELF plus its
+  cursor-theme sidecar outside ASAR. All remain paired with the application
+  release. This applies to the Ubuntu 24.04 GNOME/Xorg beta and guarded
+  GNOME/Wayland beta; remote/cloud boxes and the isolated Local VM remain
+  separate providers. NOT Swift — the Swift file everyone remembers
   (`examples/embedded-host-macos/ExampleAgentHarness.swift`) is a 165-line
   reference host showing the embedding pattern, not the driver.
 - **Browser use = the app's own Chromium first.** Electron *is* Chromium;
@@ -47,12 +49,12 @@ does not replace remote/cloud boxes or the isolated Local VM provider. Local
 alternatives evaluated and rejected:
 
 The Ubuntu GNOME beta uses the same official CUA provider with the Phase 5
-supply-chain contract tracked in [#113](https://github.com/milind-soni/OpenMausBot/issues/113): pinned archive
+supply-chain contract tracked in [#113](https://github.com/milind-soni/Astra/issues/113): pinned archive
 and inner hashes, exact archive allowlist, outside-ASAR resources, full notices/SBOM, no runtime download/update,
 and fail-closed packaged discovery. Electron still owns a private embedded daemon/socket, and the harness only
-receives the validated MCP proxy contract. Xorg is tracked in [#79](https://github.com/milind-soni/OpenMausBot/issues/79);
+receives the validated MCP proxy contract. Xorg is tracked in [#79](https://github.com/milind-soni/Astra/issues/79);
 GNOME/Wayland additionally requires WinRects v8 plus the exact Cua health-report contract tracked in
-[#109](https://github.com/milind-soni/OpenMausBot/issues/109).
+[#109](https://github.com/milind-soni/Astra/issues/109).
 
 | Option | Verdict |
 | --- | --- |
@@ -64,8 +66,8 @@ GNOME/Wayland additionally requires WinRects v8 plus the exact Cua health-report
 
 1. **Spawn from the Electron main process, never from the server/gateway
    layer.** macOS TCC attributes a spawned child to its "responsible process".
-   Spawned from Electron main → the grant is OpenMausBot's, users see ONE
-   prompt named OpenMausBot, and the bundled driver inherits it. Spawned from
+   Spawned from Electron main → the grant is Astra's, users see ONE
+   prompt named Astra, and the bundled driver inherits it. Spawned from
    a Node gateway/daemon → the identity silently becomes the gateway's and
    `check_permissions` cannot detect the misattribution. The harness must ask
    Electron main for the driver socket path over IPC, not spawn the driver.
@@ -82,7 +84,7 @@ GNOME/Wayland additionally requires WinRects v8 plus the exact Cua health-report
 
 ### macOS packaging target
 
-- Ship the binary at `OpenMausBot.app/Contents/Resources/cua-driver`,
+- Ship the binary at `Astra.app/Contents/Resources/cua-driver`,
   **outside the ASAR**, executable bit preserved (electron-builder
   `extraResources`).
 - **Re-sign it with our Team ID** before signing + notarizing the app (the
@@ -126,6 +128,24 @@ it and injects the block. The driver's own non-idempotent-action safety and
 the `ax → ax_fg → cgevent → cgevent_fg → cgevent_hid` delivery ladder
 (background pid-addressed input first — does not steal the user's cursor) are
 handled inside the binary; the host adds nothing.
+
+### The descriptor is re-checked, not trusted
+
+The descriptor names a daemon, and a daemon can be gone by the time anyone
+reads it: an embedded host dies with the parent that owns it, a standalone
+daemon can be stopped by the user or the OS, and a machine that slept can wake
+to a closed pipe. Left alone, the panel keeps rendering the mode it was told
+and every tool call fails inside a turn with a spawn error instead of an
+honest "computer use is not running".
+
+`electron/cua-watchdog.cjs` probes the socket the descriptor names — on an
+interval, and again whenever the renderer asks for the connection — and
+restarts the daemon through `startCua` when it is gone, once per dead socket
+however many checks overlap. A descriptor that names no socket (a start that
+failed, Linux's own runtime) is left alone, so a driver that just refused to
+come up is not restarted in a loop. The restart's own persist pushes the
+corrected state to the renderer, which is why a read returns the stored
+descriptor and never blocks on a launch.
 
 Driver tool surface (per `cua-driver list-tools`): start_session, click,
 double_click, right_click, drag, scroll, type_text, press_key, hotkey,

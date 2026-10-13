@@ -42,7 +42,7 @@ import { showToolCallsEnabled, skillAuthoringEnabled } from "@/lib/feature-flags
 import { stateForBot } from "@/lib/mascot";
 import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
-import { ChatMarkdown } from "./ChatMarkdown";
+import { ReplySections } from "./ReplySections";
 import { RawMarkdownView, RawToggleAction } from "./RawMarkdownToggle";
 import { ThreadChip } from "./ThreadChip";
 import { VerifyCard } from "./VerifyCard";
@@ -438,7 +438,7 @@ function Bubble({
               {viewRaw && text ? (
                 <RawMarkdownView text={text} />
               ) : text ? (
-                <ChatMarkdown text={text} mentionPeers={mentionPeers} message={{ threadId: bot.threadId, messageId: message.id }} />
+                <ReplySections text={text} mentionPeers={mentionPeers} message={{ threadId: bot.threadId, messageId: message.id }} />
               ) : null}
             </MessageBoundary>
           )}
@@ -1348,7 +1348,7 @@ export function ChatView({ bot: profile }: { bot: Bot }) {
           )}
           <TurnPresence
             avatar={
-              // BotAvatar, not a bare MausAvatar: an uploaded profile image
+              // BotAvatar, not a bare AstraAvatar: an uploaded profile image
               // (and a chosen mascot body) must match the sidebar row.
               <BotAvatar
                 bot={bot}

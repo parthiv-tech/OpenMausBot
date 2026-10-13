@@ -6,10 +6,12 @@
 // touching its siblings.
 import { findCliCandidates } from "../env-path.ts";
 import { installNpmEngine, npmAvailable, serverInstallFor } from "../engine-install.ts";
+import { remoteCatalogFor } from "../model-catalog-remote.ts";
 import type {
   AnyProviderDriver,
   InstanceConfigMap,
   InstanceId,
+  ModelCatalog,
   ProviderAuthenticationStart,
   ProviderAuthenticationStatus,
   ProviderInstance,
@@ -62,14 +64,19 @@ export class ProviderRegistry {
   private cliByInstance = new Map<InstanceId, string>();
   private driversByKind: Map<string, AnyProviderDriver>;
   /** Where Settings-driven npm installs go; the data directory by default. */
-  private readonly enginesBaseDir: string | undefined;
-  /** Whether npm is on this machine; injectable because the PATH scan also
-   * looks in standard install locations, which tests cannot empty. */
+  private readonly enginesBaseDir: string | undefined;  /** Whether npm is on this machine; injectable because the PATH scan also
+   *  looks in standard install locations, which tests cannot empty. */
   private readonly npmPresent: () => boolean;
+  /** Rows to fall back to when an engine's own probe reports nothing. */
+  private readonly remoteCatalog: (driverKind: string) => ModelCatalog | null;
 
-  constructor(drivers: readonly AnyProviderDriver[], options: { enginesBaseDir?: string; npmAvailable?: () => boolean } = {}) {
+  constructor(
+    drivers: readonly AnyProviderDriver[],
+    options: { enginesBaseDir?: string; npmAvailable?: () => boolean; remoteCatalog?: (driverKind: string) => ModelCatalog | null } = {},
+  ) {
     this.enginesBaseDir = options.enginesBaseDir;
     this.npmPresent = options.npmAvailable ?? npmAvailable;
+    this.remoteCatalog = options.remoteCatalog ?? remoteCatalogFor;
     this.driversByKind = new Map(drivers.map((d) => [d.driverKind, d]));
   }
 
@@ -153,6 +160,40 @@ export class ProviderRegistry {
     if (!instance) return false;
     await instance.refreshModels?.();
     return true;
+  }
+
+  /** Refresh every live engine's catalog in one pass. The callers that fan out
+   *  to `refreshModels` per instance end up describing the whole fleet once per
+   *  instance — N engine probes for an N-engine fleet — so the app-open path
+   *  uses this and describes once. Returns how many instances answered. */
+  async refreshAllModels(): Promise<number> {
+    const results = await Promise.allSettled(this.instances().map((instance) => instance.refreshModels?.()));
+    return results.filter((result) => result.status === "fulfilled").length;
+  }
+
+  /** Add the models that shipped after this app release to an engine that could
+   *  not answer its own probe.
+   *
+   *  Trigger: the instance is healthy (installed, and not signed out) AND still
+   *  reports the catalog the driver bundles with the app. A driver publishes its
+   *  probe result by REPLACING `models`, so identity against the driver's
+   *  declared catalog is what says "the probe never answered" — a timed-out
+   *  spawn, a machine briefly offline, a CLI with no catalog subcommand. When it
+   *  did answer, that answer is authoritative and is never second-guessed.
+   *
+   *  The bundled rows stay first and keep the default; catalog rows only fill in
+   *  behind them, which is what makes this safe for an engine whose list is
+   *  curated by hand. An unavailable or signed-out engine gets nothing: offering
+   *  a pick it cannot run is worse than offering none. */
+  private withRemoteCatalog(driver: AnyProviderDriver | undefined, models: ModelCatalog, snapshot: ProviderSnapshot): ModelCatalog {
+    if (!driver || models !== driver.models) return models;
+    if (snapshot.state !== "available" || snapshot.authenticated === false) return models;
+    const remote = this.remoteCatalog(driver.driverKind);
+    if (!remote) return models;
+    const known = new Set(models.options.map((option) => option.id));
+    const additions = remote.options.filter((option) => !known.has(option.id));
+    if (!additions.length) return models;
+    return { default: models.default || remote.default, options: [...models.options, ...additions] };
   }
 
   /** A driver's own installer (a managed download) first; otherwise the
@@ -244,7 +285,7 @@ export class ProviderRegistry {
           driverKind: inst.driverKind,
           displayName: inst.displayName ?? inst.driverKind,
           snapshot,
-          models: inst.models,
+          models: this.withRemoteCatalog(driver, inst.models, snapshot),
           capabilities: {
             computerMcp: inst.adapter.capabilities.computerMcp === true,
             agentsMcp: inst.adapter.capabilities.agentsMcp === true,

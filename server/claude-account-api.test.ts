@@ -58,7 +58,7 @@ async function idle(id: string) {
 
 beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), "omb-claude-account-api-"));
-  dataDir = join(home, ".openmausbot");
+  dataDir = join(home, ".astra");
   mkdirSync(dataDir, { recursive: true });
   cli = join(home, "fixture-claude.mjs");
   // The official-style auth probe stays synthetic; turns reuse the repository
@@ -107,8 +107,8 @@ await import(${JSON.stringify(pathToFileURL(join(SERVER_DIR, "testing", "fake-cl
       PATH: process.env.PATH,
       ...(process.env.PATHEXT ? { PATHEXT: process.env.PATHEXT } : {}),
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-      HOME: home, USERPROFILE: home, OMB_DATA_DIR: dataDir,
-      OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(port + 1), OMB_SSE_HEARTBEAT_MS: "50",
+      HOME: home, USERPROFILE: home, ASTRA_DATA_DIR: dataDir,
+      ASTRA_PORT: String(port), ASTRA_WEBHOOK_PORT: String(port + 1), ASTRA_SSE_HEARTBEAT_MS: "50",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -235,6 +235,18 @@ describe("Claude account HTTP API", () => {
       stream.close();
       await api("POST", `/api/bots/${runningBot.id}/interrupt`, {});
     }
+  });
+
+  it("refreshes every engine's catalog in one request instead of one per engine", async () => {
+    const batch = await api("POST", "/api/instances/refresh-models", {});
+    expect(batch.status, JSON.stringify(batch.body)).toBe(200);
+    // The answer is the whole fleet description, same shape as the per-instance
+    // route — a client cannot tell the two apart except by the request it made.
+    expect(batch.body.instances.some((row: any) => row.instanceId === "claude" && row.snapshot.state === "available")).toBe(true);
+    expect((await api("POST", "/api/instances/refresh-models", {}, { "content-type": "text/plain" })).status).toBe(415);
+    // The single-instance action is unchanged, including its 404.
+    expect((await api("POST", "/api/instances/claude/refresh-models", {})).status).toBe(200);
+    expect((await api("POST", "/api/instances/missing/refresh-models", {})).status).toBe(404);
   });
 
   it("enforces JSON, validation, duplicate-directory and admin-only mutation gates", async () => {

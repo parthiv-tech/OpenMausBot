@@ -4,7 +4,7 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 // Sandboxed preloads receive Electron's restricted `require`, which cannot
 // load sibling CommonJS files. Keep this tiny predicate inline here; main's
-const desktopRemoteClient = process.argv.includes("--openmausbot-remote-client");
+const desktopRemoteClient = process.argv.includes("--astra-remote-client");
 
 let pendingPackageInstallUrl = null;
 const packageInstallListeners = new Set();
@@ -31,7 +31,7 @@ const bridge = {
     ipcRenderer.on("desktop:capabilities-changed", handler);
     return () => ipcRenderer.removeListener("desktop:capabilities-changed", handler);
   },
-  /** Pair this desktop app to another OpenMausBot host. The bearer remains in
+  /** Pair this desktop app to another Astra host. The bearer remains in
    * the main process and is never returned over this bridge. */
   remoteClient: {
     active: desktopRemoteClient,
@@ -125,7 +125,7 @@ const bridge = {
   /** Tell the window which skin the page wears, so the native chrome the
    * renderer cannot paint (the Windows caption-button overlay) matches. */
   applySkin: (skin) => ipcRenderer.invoke("desktop:skin", skin),
-  /** A reviewed BotMRR package opened through openmausbot://install. */
+  /** A reviewed BotMRR package opened through astra://install. */
   onPackageInstall: (cb) => {
     packageInstallListeners.add(cb);
     if (pendingPackageInstallUrl) cb(pendingPackageInstallUrl);
@@ -137,6 +137,8 @@ const bridge = {
   desktopViewer: {
     open: (url, title, contextId) => ipcRenderer.invoke("desktop-viewer:open", url, title, contextId),
     close: (contextId) => ipcRenderer.invoke("desktop-viewer:close", contextId),
+    /** Lights the driving beam on the open viewer while this bot controls the computer. */
+    setDriving: (contextId, driving) => ipcRenderer.invoke("desktop-viewer:driving", contextId, driving),
     currentState: () => ipcRenderer.invoke("desktop-viewer:state-now"),
     onState: (cb) => {
       const handler = (_event, state) => cb(state);
@@ -161,7 +163,7 @@ const bridge = {
   /** Writes the redacted diagnostics report to a user-chosen file; resolves
    * the path, or null when the save dialog was cancelled. */
   exportDiagnostics: () => ipcRenderer.invoke("desktop:export-diagnostics"),
-  /** Ask where to save a bot-created file (inside ~/.openmausbot), copy it
+  /** Ask where to save a bot-created file (inside ~/.astra), copy it
    * there and reveal it. Returns the chosen path, or null if the user
    * cancelled the dialog. The chat bubble shows the
    * rejection text verbatim, so strip the "Error invoking remote method"
@@ -173,6 +175,25 @@ const bridge = {
     }),
   /** Store a provider credential with OS-backed encryption. */
   setCredential: (name, value) => ipcRenderer.invoke("credential:set", name, value),
+
+  /** Copy dictated text into the system clipboard (main-process write, so
+   * focus stays with the window holding the composer). */
+  writeClipboardText: (text) => ipcRenderer.invoke("clipboard:write-text", text),
+  /** Read the clipboard — how the Handy dictation bridge detects the
+   * transcript Handy left there when it finished. */
+  readClipboardText: () => ipcRenderer.invoke("clipboard:read-text"),
+  /** One-way toggle of the Handy offline dictation app. Resolves { ok };
+   * { ok: false, error } when the executable is missing. */
+  handyToggle: (handyPath) => ipcRenderer.invoke("handy:toggle", handyPath),
+  /** Read-only view of Handy's engine: selected model, installed models and
+   * this device. Astra never writes Handy's settings file; pass `model` to
+   * pin an engine for Astra's own calls instead. */
+  handyModels: (handyPath) => ipcRenderer.invoke("handy:models", handyPath),
+  handyTranscribeFile: (wavPath, handyPath, model) => ipcRenderer.invoke("handy:transcribe-file", wavPath, handyPath, model),
+
+  /** The Picovoice AccessKey for the "Astra" wake word, from the encrypted
+   * credential store. Null when none is saved. */
+  picovoiceAccessKey: () => ipcRenderer.invoke("wake-word:access-key"),
 
   /** In-app auto-update. State object:
    *  { status: "idle"|"checking"|"available"|"downloading"|"downloaded"|"error",

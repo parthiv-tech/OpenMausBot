@@ -159,15 +159,17 @@ const __APP_VERSION__: string;
       openExternal?(url: string): Promise<boolean>;
       /** Recolor the native window chrome for a skin; absent on older builds. */
       applySkin?(skin: string): Promise<boolean>;
-      /** Receives a GitHub package URL opened through openmausbot://install. */
+      /** Receives a GitHub package URL opened through astra://install. */
       onPackageInstall?(cb: (url: string) => void): () => void;
       /** Updates the native Dock/taskbar unread indicator. */
       setUnreadCount?(count: number): void;
-      /** Opens a live desktop as a sandboxed window owned by OpenMausBot. */
+      /** Opens a live desktop as a sandboxed window owned by Astra. */
       desktopViewer?: {
         open(url: string, title: string, contextId: string): Promise<boolean>;
         /** Closes the live-desktop window, but only when it belongs to this bot. */
         close(contextId: string): Promise<boolean>;
+        /** Lights the driving beam on the open viewer while this bot drives. */
+        setDriving(contextId: string, driving: boolean): Promise<boolean>;
         /** The current viewer state, for a panel to initialize from on mount. */
         currentState(): Promise<{ open: boolean; contextId: string | null }>;
         onState(cb: (state: { open: boolean; contextId: string | null }) => void): () => void;
@@ -195,15 +197,34 @@ const __APP_VERSION__: string;
       /** Writes the redacted diagnostics report to a user-chosen file;
        * resolves the path, or null when cancelled. */
       exportDiagnostics?(): Promise<string | null>;
-      /** Asks where to save a bot-created file (inside ~/.openmausbot), copies
+      /** Asks where to save a bot-created file (inside ~/.astra), copies
        * it there and reveals it. Resolves the chosen path, or null if the
        * user cancelled the dialog. */
       saveFile?(filePath: string): Promise<string | null>;
       /** Save a provider credential through Electron's OS-backed store. */
       setCredential?(
-        name: "composioApiKey" | "xaiApiKey" | "boxToken" | "opencodeGoApiKey" | "ttsKey" | "openaiImageApiKey" | "customImageApiKey",
+        name: "composioApiKey" | "xaiApiKey" | "visionApiKey" | "picovoiceAccessKey" | "boxToken" | "opencodeGoApiKey" | "ttsKey" | "openaiImageApiKey" | "customImageApiKey",
         value: string,
       ): Promise<ConfigStatus>;
+      /** Copy dictated text into the system clipboard. Resolves once written. */
+      writeClipboardText?(text: string): Promise<{ written: boolean }>;
+      /** Read the system clipboard (the Handy dictation bridge detects the
+       * transcript Handy left there). */
+      readClipboardText?(): Promise<string>;
+      /** Toggle Handy (the offline speech-to-text app) on or off. Resolves
+       * { ok: false, error } when the executable is missing. */
+      handyToggle?(handyPath: string): Promise<{ ok: boolean; error?: string }>;
+      /** Read-only view of Handy's engine, for Settings. Astra never writes
+       * Handy's settings file — see HandyEngineStatus. */
+      handyModels?(handyPath: string): Promise<HandyEngineStatus>;
+      /** Headless transcription of WAV bytes through the user's Handy
+       * install (offline model). `model` pins the engine for this call;
+       * omitted, Handy uses the model selected in its own window. */
+      handyTranscribeFile?(wav: ArrayBuffer, handyPath: string, model?: string): Promise<{ ok: boolean; text?: string; error?: string }>;
+      /** The Picovoice AccessKey for the "Astra" wake word, from the OS-backed
+       * encrypted store (or ASTRA_PICOVOICE_KEY in dev). Null when none is
+       * saved — the wake word then stays off and Settings explains why. */
+      picovoiceAccessKey?(): Promise<string | null>;
       /** In-app auto-update (packaged app only; dormant in dev). onState
        * fires immediately with the current state, then on transitions. */
       updater?: {
@@ -215,6 +236,36 @@ const __APP_VERSION__: string;
       };
     };
   }
+}
+
+/** What the desktop shell can honestly report about the user's Handy
+ * install. `installed` is what Handy's own models directory contains, which
+ * can differ from `selected` when a model was chosen but never downloaded. */
+export interface HandyEngineStatus {
+  ok: boolean;
+  /** False when no Handy executable could be found at all. */
+  found: boolean;
+  /** The executable this shell would spawn. */
+  exe: string;
+  /** The model selected inside Handy, or null when unreadable. */
+  selected: string | null;
+  /** Model directories present in Handy's own models folder. Covers custom
+   * models the catalog does not know about. */
+  installed: string[];
+  /** Handy's own catalog (`--list-models --json`), trimmed. Empty when Handy
+   * could not answer, which the panel must treat as "unknown", not "none". */
+  catalog: HandyCatalogModel[];
+  device: { platform: string; arch: string; cpu: string; cores: number; ramGB: number };
+}
+
+/** One catalog entry. `id` is what `--model` accepts — deliberately not the
+ * models-directory folder name, which Handy rejects. */
+export interface HandyCatalogModel {
+  id: string;
+  /** Display name ("Parakeet V2"), falling back to the id. */
+  name: string;
+  sizeMB: number;
+  downloaded: boolean;
 }
 
 export interface LinuxLocalControlStatus {

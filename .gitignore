@@ -11,9 +11,9 @@ dist-server
 .DS_Store
 *.tsbuildinfo
 electron/resources/speech-helper
-electron/resources/OpenMausBot Speech.app
+electron/resources/Astra Speech.app
 # stale helper from the removed Teach a skill recorder
-electron/resources/OpenMausBot Recorder.app
+electron/resources/Astra Recorder.app
 release
 .omb-scratch
 .wrangler/
@@ -25,6 +25,7 @@ cloudflare/control-plane/worker-configuration.d.ts
 .claude/worktrees/
 .vercel/
 .pi/
+.freebuff/
 
 # Release signing material. The signing keys for the mobile stores belong to the
 # maintainer and never enter this repository; these patterns are the second line

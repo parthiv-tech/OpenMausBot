@@ -10,7 +10,7 @@ reruns and recovery. It
 builds macOS (arm64 + x64, signed, notarized, stapled), Windows, and Ubuntu
 from a single pinned commit, verifies every artifact the way a user would
 receive it, and assembles the canonical draft in
-[OpenMausBot releases](https://github.com/milind-soni/OpenMausBot/releases).
+[Astra releases](https://github.com/milind-soni/Astra/releases).
 The exact same assets are also staged in the public legacy releases repo so
 installed builds from 0.1.46 and earlier can update across the repository
 migration.
@@ -36,13 +36,33 @@ refreshes it.
 
 ## Updater migration invariant
 
+**Current state, 2026-09-20.** The Astra rename is staged throughout the
+codebase but has not been made on GitHub. `milind-soni/Astra` and
+`milind-soni/astra-releases` both resolve to nothing, so builds that named
+them baked a feed that 404s on every check — the installed app reports
+"up to date" forever and nothing is ever delivered. Until the rename lands,
+the feed target (`electron-builder.yml`), the browser-engine download
+(`server/browser-engine-release.ts`), the in-app links (`src/lib/app-links.ts`)
+and the CI assertions that pin all of them name `milind-soni/OpenMausBot`,
+which is where the releases and the pinned browser assets actually are.
+
+Renaming the repository to `Astra` is the fix that reaches already-installed
+apps — GitHub redirects the old name, so both spellings keep working. Before
+the rename, note that the existing releases there carry the *old* brand, and
+v0.1.84 is newer than the Astra builds installed today: an installed 0.1.75
+would be offered `OpenMausBot-0.1.84-setup.exe`. Cut an Astra-named version
+above 0.1.84 on the renamed repository first. `astra-releases` is missing and
+must be created before the legacy-mirror half of the Release workflow can run.
+
+The invariant itself:
+
 `app-update.yml` is baked into every packaged desktop app. Builds through
-0.1.46 point to `milind-soni/openmausbot-releases`; newer builds point to
-`milind-soni/OpenMausBot`. For that reason:
+0.1.46 point to `milind-soni/astra-releases`; newer builds point to
+`milind-soni/Astra`. For that reason:
 
 1. Every new release is published byte-for-byte to both repositories during
    the bridge period.
-2. `openmausbot-releases` must stay public. Do not delete its final bridge
+2. `astra-releases` must stay public. Do not delete its final bridge
    release, feeds, or assets.
 3. README and docs downloads point at the canonical repo, while the legacy
    mirror exists only for installed updater clients and historical releases.
@@ -73,7 +93,7 @@ must fail the build, not ship an installer that downloads them on first use.
 
 ## One-time setup: release secrets
 
-Set these in **OpenMausBot → Settings → Secrets and variables → Actions**.
+Set these in **Astra → Settings → Secrets and variables → Actions**.
 
 The **Prepare next release** workflow also needs
 **Settings → Actions → General → Workflow permissions → Allow GitHub Actions
@@ -109,7 +129,7 @@ base64 -i AuthKey_XXXXXXXX.p8 | pbcopy   # → APPLE_API_KEY_P8_BASE64
 
 A fine-grained personal access token that lets the workflow write to the
 legacy updater mirror: **GitHub → Settings → Developer settings →
-Fine-grained tokens** → repository access: only `openmausbot-releases` →
+Fine-grained tokens** → repository access: only `astra-releases` →
 permissions: **Contents: Read and write**. Set a long expiry and a calendar
 reminder. The canonical release uses the workflow's scoped `GITHUB_TOKEN` and
 does not need a PAT.

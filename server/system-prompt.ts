@@ -22,6 +22,19 @@ export type PromptSection = PromptPart & { bytes: number };
  * turn that tagged a bot. */
 const VOLATILE_SECTIONS = new Set(["memory", "mentions"]);
 
+/** How a reply is shaped, which is not a formatting preference but the thing
+ * that lets one message serve two audiences at once: somebody reading the
+ * transcript, and somebody listening to it. The lead is what a voice reads
+ * and what the reader sees first; the sections under it are opened on demand.
+ *
+ * It is injected by the builder rather than handed in at each call site, so
+ * the 1:1 path, a room turn, and the settings preview cannot disagree about
+ * it — and so a bot that has never heard of the convention is told about it
+ * on its next turn. Kept to a few sentences: it is in the stable half of
+ * every prompt, and a long formatting rule is itself a formatting failure. */
+export const REPLY_SHAPE_PROMPT =
+  " Reply shape: open with a lead — one to three sentences of plain prose saying what you did or found, written to be heard. Keep code, file paths, tables, and lists for the sections. When there is detail worth keeping, put it under markdown headings, one topic each: the lead is read first and read aloud, and the sections under it are opened on demand. Do not repeat the lead in them. Tool calls ride the tool channel — never write tool-call JSON in your reply or narrate emitting it; say in prose what you did.";
+
 export function buildSystemPrompt(
   persona: string,
   soul: string,
@@ -30,6 +43,9 @@ export function buildSystemPrompt(
   const ordered: PromptPart[] = [
     { id: "persona", label: "Identity", text: persona },
     { id: "soul", label: "Standing instructions (SOUL.md)", text: soulSystemPrompt(soul) },
+    // ahead of the caller's parts: how to answer is a property of every
+    // reply, not of the tools this particular turn happened to mount
+    { id: "reply-shape", label: "Reply shape", text: REPLY_SHAPE_PROMPT },
     ...parts,
   ];
   const sections = ordered
@@ -58,7 +74,7 @@ const COMPUTER_PARAGRAPH: Record<ComputerPromptKind, string> = {
   vps:
     " You have your own self-hosted remote Linux computer through the official Cua tools. Its filesystem is disposable: everything on it is wiped whenever its container is recreated, so keep long-lived work somewhere durable — push it to a remote, or hand the results back in chat — instead of leaving it only on that computer. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and act carefully.",
   local:
-    " You can act on the user's computer through the computer tools. Discover the target app/window and inspect its state first. Prefer window-targeted accessibility actions with background delivery so the user can keep working in another app; do not bring OpenMausBot or another app to the front just to inspect it. Use the dedicated browser tools for browser work when available, keeping the user's intended browser profile/account, and OpenMausBot's configuration/proposal tools for supported bot setup rather than clicking through this app. Full-desktop input, app activation, and foreground delivery can move the real cursor, change focus, or switch desktops: use them only when the user asked for foreground control or agrees after background control reports it cannot perform the action. Do not silently retry a background refusal as foreground input, including through shell scripts, AppleScript/System Events, or another automation tool. If a background action unexpectedly changes focus, report it and stop that route rather than continuing to interrupt the user. Never promise that arbitrary desktop actions can run in the background.",
+    " You can act on the user's computer through the computer tools. Discover the target app/window and inspect its state first. Prefer window-targeted accessibility actions with background delivery so the user can keep working in another app; do not bring Astra or another app to the front just to inspect it. Use the dedicated browser tools for browser work when available, keeping the user's intended browser profile/account, and Astra's configuration/proposal tools for supported bot setup rather than clicking through this app. Full-desktop input, app activation, and foreground delivery can move the real cursor, change focus, or switch desktops: use them only when the user asked for foreground control or agrees after background control reports it cannot perform the action. Do not silently retry a background refusal as foreground input, including through shell scripts, AppleScript/System Events, or another automation tool. If a background action unexpectedly changes focus, report it and stop that route rather than continuing to interrupt the user. Never promise that arbitrary desktop actions can run in the background.",
 };
 
 /** The computer paragraph plus the shared sign-in policy. A box driven by

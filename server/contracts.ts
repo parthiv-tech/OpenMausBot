@@ -51,7 +51,7 @@ export interface ModelSelection {
   effort?: EffortLevel;
 }
 
-/** An image already admitted to OpenMausBot's private attachment store.
+/** An image already admitted to Astra's private attachment store.
  * Drivers receive this structured value instead of learning a host path from
  * prompt text. The harness validates the path and size before constructing it. */
 export interface TurnImageInput {
@@ -186,9 +186,30 @@ export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavail
 // becomes onEvent(listener) → unsubscribe; sessions start implicitly on
 // the first turn (the agentcal per-turn-process model) with resumeCursor
 // carrying the provider-native continuation (e.g. a claude session id).
+/** One tool the harness has mounted for this turn, ready to execute.
+ * Built from the same MCP servers CLI engines mount natively; API engines
+ * call execute() and get the result normalized for the model. */
+export interface RuntimeTool {
+  name: string;
+  description?: string;
+  /** JSON Schema for the arguments object, as the MCP server advertises. */
+  parameters?: unknown;
+  execute(args: Record<string, unknown> | undefined): Promise<{
+    isError: boolean;
+    text: string;
+    images: Array<{ data: string; mimeType: string }>;
+  }>;
+}
+
 export interface SendTurnInput {
   threadId: ThreadId;
   text: string;
+  /** Harness-mounted tools for API-driven engines. CLI engines mount
+   * `integrations.*` MCP servers natively; API engines (no CLI process)
+   * receive ready-to-call tool executors instead and drive them through an
+   * OpenAI-compatible tool loop. Present only when a surface was actually
+   * mounted for this turn; the runtime owns closing the toolbox. */
+  tools?: { list: RuntimeTool[]; close(): Promise<void> };
   /** Per-bot approval policy, reasserted by providers on every turn so a
    * resumed native session cannot retain a stale, more permissive mode. */
   approvalMode?: ApprovalMode;
@@ -224,7 +245,7 @@ export interface SendTurnInput {
      * bridge harness-controlled lets it turn connection requests into trusted
      * chat cards consistently across provider CLIs. */
     composio?: { command: string; args: string[]; env: Record<string, string> };
-    /** Cloud computer, reached through OpenMausBot's REST-to-MCP adapter.
+    /** Cloud computer, reached through Astra's REST-to-MCP adapter.
      * `control` is the harness's loopback who-is-driving endpoint: the
      * adapter consults it so a person who takes the wheel in the panel
      * pauses the bot's hands mid-turn instead of typing over them. */
@@ -319,6 +340,11 @@ export interface ProviderAdapter {
      * MCP servers from config). Same rule as composioMcp: an entry in the
      * config says the servers exist, not that this engine can reach them. */
     customMcp?: boolean;
+    /** True when sendTurn consumes `tools` (the harness-built tool executors
+     * for API-driven engines) and runs the OpenAI-compatible tool loop.
+     * computerMcp/browserMcp may be advertised only together with this on
+     * API drivers: the flags promise tools the turn can actually call. */
+    apiToolLoop?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;

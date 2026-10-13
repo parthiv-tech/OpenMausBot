@@ -14,7 +14,7 @@ import {
   type ReactNode,
 } from "react";
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
-import type { MausColor, MausMotion } from "@/lib/mascot";
+import type { AstraColor, AstraMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import { approvalModeFor, type ApprovalMode } from "../../shared/approval-mode";
 import type { MascotBodyId } from "../../shared/mascot-bodies";
@@ -57,7 +57,7 @@ function trimRoutineRuns(runs: readonly RoutineRun[]): RoutineRun[] {
   });
 }
 
-export type { MausColor } from "@/lib/mascot";
+export type { AstraColor } from "@/lib/mascot";
 export type { RoutineRunCardData } from "../../shared/routine-run";
 
 export interface OptionCardData {
@@ -153,11 +153,11 @@ export interface Message {
   /** Stable client identity for at-most-once chat POST retries. */
   sendId?: string;
   /** rooms: which member said this (sender attribution). */
-  from?: { botId: string; name: string; color: MausColor };
+  from?: { botId: string; name: string; color: AstraColor };
   /** emoji reactions; by = "user" or a member botId. */
   reactions?: Array<{ emoji: string; by: string }>;
   /** comm chips: "Messaged @X" linking to the bot⇄bot channel. */
-  comm?: { groupId: string; withBotId: string; withName: string; withColor: MausColor };
+  comm?: { groupId: string; withBotId: string; withName: string; withColor: AstraColor };
   /** thread chips: "Opened thread #Title on Bot" linking to that thread */
   threadRef?: { botId: string; threadId: string; title: string };
   /** sent while the bot was mid-turn; auto-sends when the turn settles.
@@ -285,7 +285,7 @@ export interface Bot {
   /** The SOUL.md mirror on disk differs from the record; the Soul editor offers apply/discard. */
   soulDrift?: boolean;
   notifications: boolean;
-  color: MausColor;
+  color: AstraColor;
   mascotExpression?: string | null;
   /** Which body the bot wears. Unknown/absent values fall back to the cursor. */
   mascotBody?: MascotBodyId | null;
@@ -417,6 +417,9 @@ export interface ConfigStatus {
   xai?: { configured: boolean };
   anthropic?: { configured: boolean };
   openaiCompat?: { configured: boolean; url?: string };
+  vision?: { configured: boolean; url?: string };
+  /** The "Astra" wake word's Picovoice AccessKey is saved (never echoed). */
+  wakeWord?: { configured: boolean };
   /** what this server is entitled to; Settings shows only what works here */
   edition?: { edition: "oss" | "enterprise"; features: string[] };
   /** a fleet agent exists on this server (Settings → Workspaces) */
@@ -433,7 +436,18 @@ export interface ConfigStatus {
   /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "elevenlabs" | "system" };
+  tts?: {
+    configured: boolean;
+    ready: boolean;
+    voice: string;
+    provider?: "elevenlabs" | "system" | "piper";
+    piperAvailable?: boolean;
+    /** Whether this platform has a Piper build to install, and how that
+     * install is going — the one engine the user obtains from Settings. */
+    piperInstallable?: boolean;
+    piperInstalling?: boolean;
+    piperInstallError?: string | null;
+  };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: {
     configured: boolean;
@@ -450,7 +464,7 @@ export interface ConfigStatus {
   /** UI language override; "" (or absent) follows the system language. */
   language?: string;
   /** Opt-in flags. Absent means off. */
-  features?: { skillAuthoring: boolean; showToolCalls?: boolean; browser?: boolean };
+  features?: { skillAuthoring: boolean; showToolCalls?: boolean; browser?: boolean; selfModify?: boolean; wakeWord?: boolean };
   /** First-run progress: whether the welcome tour was finished and which
    * one-time hints were dismissed. Server-owned so it follows the workspace. */
   onboarding?: OnboardingStatus;
@@ -459,6 +473,8 @@ export interface ConfigStatus {
   browserEngine?: BrowserEngineSummary;
   /** Named browser sessions any bot can be pointed at. */
   browserProfiles?: BrowserProfile[];
+  /** Which Chrome the bots' browser launches; absent = Astra's managed one. */
+  browser?: { chromePath?: string };
 }
 
 export interface BrowserEngineSummary {
@@ -575,6 +591,8 @@ export type AppSettingsSection =
   | "experimental"
   | "connections"
   | "engines"
+  | "voice"
+  | "selfModify"
   | "companion"
   | "remote"
   | "computer"
@@ -656,7 +674,7 @@ export interface AppState {
   mascotMotion: {
     botId: string;
     nonce: number;
-    kind: Exclude<MausMotion, "none">;
+    kind: Exclude<AstraMotion, "none">;
   } | null;
   /** Queued follow-up lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
@@ -985,7 +1003,7 @@ function updateBot(state: AppState, botId: string, fn: (b: Bot) => Bot): AppStat
 function withMascotMotion(
   state: AppState,
   botId: string,
-  kind: Exclude<MausMotion, "none">,
+  kind: Exclude<AstraMotion, "none">,
 ): AppState {
   return {
     ...state,
@@ -2106,6 +2124,8 @@ const StoreContext = createContext<{
   refreshInstances: () => Promise<void>;
   /** Explicit provider/network model discovery. */
   refreshModels: (instanceId: string) => Promise<void>;
+  /** Every engine's catalog in one server pass — the app-open path. */
+  refreshAllModels: () => Promise<void>;
 } | null>(null);
 
 export function StoreProvider({ children }: { children: ReactNode }) {
@@ -3172,10 +3192,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     rawDispatch({ type: "instances", instances });
   }, []);
 
+  const refreshAllModels = useCallback(async () => {
+    try {
+      const { instances } = await api("/api/instances/refresh-models", { method: "POST" });
+      rawDispatch({ type: "instances", instances });
+    } catch {
+      /* offline or server down — the existing list stays */
+    }
+  }, []);
+
   // Installing a CLI or signing one in happens in a terminal, outside this
   // window — so the moment the user comes back is exactly when our engine
   // snapshot is most likely stale. Re-probe on focus, throttled so that
   // ordinary alt-tabbing doesn't spawn a `--version` call per switch.
+  // The model list should be fresh every time the app opens. Engines are
+  // signed in and out in terminals while the app is closed, and the instances
+  // snapshot the server streams at open can be hours old — so after the first
+  // snapshot lands, refresh every instance's models once, in a single request:
+  // asking per instance made the server describe the whole fleet once per
+  // engine. The stale list stays visible until the answer arrives, so opening
+  // the app is never slower for it.
+  const modelsRefreshedOnOpen = useRef(false);
+  const instanceCount = state.instances.length;
+  useEffect(() => {
+    if (modelsRefreshedOnOpen.current || instanceCount === 0) return;
+    modelsRefreshedOnOpen.current = true;
+    void refreshAllModels();
+  }, [instanceCount, refreshAllModels]);
+
   const lastFocusProbe = useRef(0);
   useEffect(() => {
     const onFocus = () => {
@@ -3193,8 +3237,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [botPatchQueue],
   );
   const value = useMemo(
-    () => ({ state, dispatch, flushBotPatches, refreshInstances, refreshModels }),
-    [state, dispatch, flushBotPatches, refreshInstances, refreshModels],
+    () => ({ state, dispatch, flushBotPatches, refreshInstances, refreshModels, refreshAllModels }),
+    [state, dispatch, flushBotPatches, refreshInstances, refreshModels, refreshAllModels],
   );
   return (
     <StoreContext.Provider value={value}>

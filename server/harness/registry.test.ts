@@ -187,6 +187,124 @@ describe("ProviderRegistry", () => {
     expect(refreshes).toEqual({ a: 2, b: 2 });
   });
 
+  it("refreshes every live catalog in one pass", async () => {
+    const fake = makeFakeDriver();
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({ a: { driver: "fake" }, b: { driver: "fake" } });
+    const seen: string[] = [];
+    for (const instanceId of ["a", "b"] as const) {
+      Object.assign(registry.get(instanceId)!, { refreshModels: async () => { seen.push(instanceId); } });
+    }
+
+    expect(await registry.refreshAllModels()).toBe(2);
+    expect(seen.sort()).toEqual(["a", "b"]);
+  });
+
+  it("probes the fleet once for an app-open refresh, not once per engine", async () => {
+    // Opening the app used to POST refresh-models per instance, and every one of
+    // those answered with a full describe() — so an N-engine fleet paid N x N
+    // engine probes. Both paths are measured here so the difference is a
+    // number, not a claim.
+    const fake = makeFakeDriver();
+    const registry = new ProviderRegistry([fake.driver]);
+    const ids = ["a", "b", "c"] as const;
+    await registry.load(Object.fromEntries(ids.map((id) => [id, { driver: "fake" }])));
+    let probes = 0;
+    for (const id of ids) {
+      const instance = registry.get(id)!;
+      const snapshot = instance.snapshot.bind(instance);
+      Object.assign(instance, { refreshModels: async () => {}, snapshot: async () => { probes += 1; return snapshot(); } });
+    }
+
+    await registry.refreshAllModels();
+    await registry.describe();
+    const batched = probes;
+
+    probes = 0;
+    for (const id of ids) {
+      await registry.refreshModels(id);
+      await registry.describe();
+    }
+
+    expect(batched).toBe(3);
+    expect(probes).toBe(9);
+  });
+
+  const REMOTE: ModelCatalog = { default: "claude-opus-5", options: [{ id: "claude-opus-5", label: "Claude Opus 5" }] };
+
+  it("adds the catalog's newer models to an engine that could not answer its probe", async () => {
+    // A timed-out spawn, a CLI with no catalog subcommand, a machine briefly
+    // offline: the picker is left with the list bundled at build time, which is
+    // the one list on this machine that cannot be newer than the app.
+    const fake = makeFakeDriver({ kind: "claudeAgent" });
+    const registry = new ProviderRegistry([fake.driver], { remoteCatalog: () => REMOTE });
+    await registry.load({ a: { driver: "claudeAgent" } });
+
+    const [described] = await registry.describe();
+    expect(described.snapshot.state).toBe("available");
+    // bundled rows first, and the bundled default is untouched
+    expect(described.models).toEqual({
+      default: "claudeAgent-1",
+      options: [
+        { id: "claudeAgent-1", label: "claudeAgent one" },
+        { id: "claude-opus-5", label: "Claude Opus 5" },
+      ],
+    });
+  });
+
+  it("fills the default when the bundled catalog has nothing at all", async () => {
+    const fake = makeFakeDriver({ kind: "qwenAgent" });
+    Object.assign(fake.driver, { models: { default: "", options: [] } });
+    const registry = new ProviderRegistry([fake.driver], { remoteCatalog: () => REMOTE });
+    await registry.load({ a: { driver: "qwenAgent" } });
+
+    const [described] = await registry.describe();
+    expect(described.models).toEqual(REMOTE);
+  });
+
+  it("never second-guesses a probe that answered", async () => {
+    // A driver publishes its probe result by replacing `models`, so a list that
+    // is no longer the driver's declared catalog IS the engine's own answer.
+    const fake = makeFakeDriver({ kind: "claudeAgent" });
+    const registry = new ProviderRegistry([fake.driver], { remoteCatalog: () => REMOTE });
+    await registry.load({ a: { driver: "claudeAgent" } });
+    Object.assign(registry.get("a")!, {
+      models: { default: "claude-opus-5", options: [{ id: "claude-opus-5", label: "Claude Opus 5" }] },
+    });
+
+    const [described] = await registry.describe();
+    expect(described.models.options.map((option) => option.id)).toEqual(["claude-opus-5"]);
+  });
+
+  it("adds nothing for an unavailable or signed-out engine", async () => {
+    // Offering a pick an engine cannot run is worse than offering none, so the
+    // catalog stops at exactly the case where the engine itself is healthy.
+    const fake = makeFakeDriver({ kind: "claudeAgent" });
+    const registry = new ProviderRegistry([fake.driver], { remoteCatalog: () => REMOTE });
+    await registry.load({ broken: { driver: "claudeAgent" }, signedout: { driver: "claudeAgent" } });
+    Object.assign(registry.get("broken")!, {
+      snapshot: async () => ({ state: "unavailable" as const, reason: "probe exploded" }),
+    });
+    Object.assign(registry.get("signedout")!, {
+      snapshot: async () => ({ state: "available" as const, authenticated: false }),
+    });
+
+    const described = Object.fromEntries((await registry.describe()).map((row) => [row.instanceId, row.models]));
+    expect(described.broken.options.map((option) => option.id)).toEqual(["claudeAgent-1"]);
+    expect(described.signedout.options.map((option) => option.id)).toEqual(["claudeAgent-1"]);
+  });
+
+  it("leaves an unmapped engine's catalog alone", async () => {
+    const fake = makeFakeDriver({ kind: "cursorAgent" });
+    let asked = 0;
+    const registry = new ProviderRegistry([fake.driver], { remoteCatalog: () => { asked += 1; return null; } });
+    await registry.load({ a: { driver: "cursorAgent" } });
+
+    const [described] = await registry.describe();
+    expect(described.models.options.map((option) => option.id)).toEqual(["cursorAgent-1"]);
+    expect(asked).toBe(1);
+  });
+
   it("disposeAll disposes every live instance and empties the registry", async () => {
     const fake = makeFakeDriver();
     const registry = new ProviderRegistry([fake.driver]);

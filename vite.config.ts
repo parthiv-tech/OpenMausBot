@@ -17,6 +17,13 @@ export default defineConfig({
     __APP_VERSION__: JSON.stringify(version),
   },
   test: {
+    alias: {
+      // The Picovoice wake-word engines ship browser-wasm entry points that
+      // Node cannot resolve; tests exercise the logic around them through
+      // Node-resolvable stubs (which individual tests may vi.mock).
+      "@picovoice/porcupine-web": fileURLToPath(new URL("./src/testing/porcupine-web-stub.ts", import.meta.url)),
+      "@picovoice/web-voice-processor": fileURLToPath(new URL("./src/testing/web-voice-processor-stub.ts", import.meta.url)),
+    },
     environment: "node",
     include: [
       "server/**/*.test.ts",
@@ -44,7 +51,7 @@ export default defineConfig({
     // IPv4 explicitly — a bare ::1 bind makes localhost a coin-flip for
     // clients that resolve IPv4 first
     host: "127.0.0.1",
-    port: Number(process.env.OMB_UI_PORT) || 5199,
+    port: Number(process.env.ASTRA_UI_PORT) || 5199,
     // packager output lands inside the repo — its HTML files must never
     // trigger dev full-page reloads
     watch: {
@@ -54,7 +61,7 @@ export default defineConfig({
     // talks to /api — clients hold no transports
     proxy: {
       "/api": {
-        target: `http://127.0.0.1:${process.env.OMB_PORT || process.env.OGB_PORT || 8799}`,
+        target: `http://127.0.0.1:${process.env.ASTRA_PORT || process.env.OGB_PORT || 8799}`,
       },
     },
   },

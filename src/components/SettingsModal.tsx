@@ -3,7 +3,7 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useRef, useState } from "react";
-import { Archive, Coins, FlaskConical, KeyRound, Monitor, Palette, Search, TabletSmartphone, Terminal, User, Users, X, Building2 } from "lucide-react";
+import { Archive, Coins, FlaskConical, KeyRound, Loader2, Mic, Monitor, Palette, Search, ShieldCheck, TabletSmartphone, Terminal, User, Users, X, Building2 } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { browserAvailable, browserUnavailableReason, builtInBrowserEnabled, showToolCallsEnabled, skillAuthoringEnabled } from "@/lib/feature-flags";
@@ -11,7 +11,7 @@ import { localeChoices, type LocaleKey } from "@/locales";
 import { t } from "@/lib/i18n";
 import { withTourReset } from "@/lib/guided-tour";
 import { completionPatch } from "@/lib/onboarding";
-import { ApiKeyRow, OpenAiCompatUrl, VpsConnection } from "./ApiKeys";
+import { ApiKeyRow, OpenAiCompatUrl, VpsConnection, VisionUrl } from "./ApiKeys";
 import { useUpdaterState } from "@/lib/updater";
 import { EnginesSettings } from "./EnginesSettings";
 import { LocalComputerSection } from "./LocalComputerSection";
@@ -21,6 +21,8 @@ import { PeopleSection } from "./PeopleSection";
 import { CustomDomainSettings } from "./CustomDomainSettings";
 import { BrowserProfilesManager } from "./BrowserProfilesManager";
 import { RemoteComputerSection } from "./RemoteComputerSection";
+import { VoiceHandySection } from "./VoiceHandySection";
+import { SelfModifySection } from "./SelfModifySection";
 import { Card, Switch } from "./SettingsPrimitives";
 import { UsageSection } from "./UsageSection";
 import { WorkspacesSection, workspacesAvailable } from "./WorkspacesSection";
@@ -46,6 +48,8 @@ const SECTIONS: Array<{
   { id: "experimental", labelKey: "settings.section.experimental", icon: FlaskConical, keywords: ["early", "preview", "learn", "skill", "authoring", "browser", "profiles"] },
   { id: "connections", labelKey: "settings.section.connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps"] },
   { id: "engines", labelKey: "settings.section.engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
+  { id: "voice", labelKey: "settings.section.voice", icon: Mic, keywords: ["voice", "speech", "text to speech", "tts", "dictation", "transcription", "handy", "wake word", "microphone", "audio", "read aloud"] },
+  { id: "selfModify", labelKey: "settings.section.selfModify", icon: ShieldCheck, keywords: ["self", "modify", "edit", "code", "source", "journal", "rollback", "revert", "failsafe", "repair", "own code"] },
   { id: "companion", labelKey: "settings.section.companion", icon: TabletSmartphone, keywords: ["companion", "device", "phone", "desktop", "client", "host", "pair", "pairing", "mobile", "https", "secure", "tailscale", "wifi", "remote", "advanced", "domain", "dns", "self-hosted", "server", "caddy"] },
   { id: "computer", labelKey: "settings.section.computer", icon: Monitor, keywords: ["vm", "virtual", "desktop"] },
   { id: "usage", labelKey: "settings.section.usage", icon: Coins, keywords: ["tokens", "cost", "billing"] },
@@ -340,6 +344,9 @@ function ToolCallsRow() {
   );
 }
 
+// The wake word's key row, the Handy engine readout, and the dictation-model
+// pin moved to Settings → Voice & Handy, next to the voice they feed.
+
 function ExperimentalFeaturesRow() {
   const { state, dispatch } = useStore();
   const skillAuthoring = skillAuthoringEnabled(state.config);
@@ -417,6 +424,76 @@ function BrowserProfilesRow() {
   return (
     <Card title={t("settings.profiles.title")} subtitle={t("settings.profiles.sharedSubtitle")}>
       <BrowserProfilesManager />
+    </Card>
+  );
+}
+
+const WINDOWS_CHROME_HINT = "%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe";
+
+/** Which Chrome the bots' browser launches: Astra's own managed one, or the
+ *  Chrome installed on this machine. A configured path that no longer exists
+ *  stays editable (so it can be fixed) while the server quietly falls back. */
+function ChromeBrowserRow() {
+  const { state, dispatch } = useStore();
+  const configured = state.config?.browser?.chromePath ?? "";
+  const [path, setPath] = useState(configured);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => setPath(configured), [configured]);
+
+  const save = async (next: string) => {
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const config: ConfigStatus = await api("/api/config", {
+        method: "PUT",
+        body: JSON.stringify({ browser: { chromePath: next } }),
+      });
+      dispatch({ type: "configStatus", config });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("settings.browser.error"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card title={t("settings.browser.title")} subtitle={t("settings.browser.subtitle")}>
+      <div className="flex flex-col gap-2">
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            onBlur={() => path.trim() !== configured && void save(path.trim())}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                if (path.trim() !== configured) void save(path.trim());
+              }
+            }}
+            placeholder={WINDOWS_CHROME_HINT}
+            spellCheck={false}
+            aria-label={t("settings.browser.title")}
+            className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
+          />
+          <button
+            type="button"
+            onClick={() => void save(path.trim())}
+            disabled={saving || path.trim() === configured}
+            className="shrink-0 rounded-lg bg-control px-3 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {saving ? <Loader2 size={13} className="animate-spin" /> : t("settings.browser.save")}
+          </button>
+        </div>
+        <p className="text-[12px] leading-relaxed text-ink-secondary">{t("settings.browser.hint")}</p>
+        {error ? (
+          <p role="alert" className="text-[12px] text-danger">
+            {error}
+          </p>
+        ) : null}
+      </div>
     </Card>
   );
 }
@@ -648,6 +725,7 @@ export function SettingsModal() {
             {section === "experimental" && (
               <>
                 <ExperimentalFeaturesRow />
+                <ChromeBrowserRow />
                 <BrowserProfilesRow />
               </>
             )}
@@ -668,6 +746,8 @@ export function SettingsModal() {
                   <ApiKeyRow section="anthropic" testProvider="anthropic" />
                   <ApiKeyRow section="openaiCompat" testProvider="openaiCompat" />
                   <OpenAiCompatUrl />
+                  <ApiKeyRow section="vision" />
+                  <VisionUrl />
                   <ApiKeyRow section="xai" testProvider="xai" />
                   <div className="pt-2 text-[11.5px] font-medium uppercase tracking-wide text-ink-secondary">{t("keys.integrations.title")}</div>
                   <ApiKeyRow section="box" />
@@ -686,6 +766,10 @@ export function SettingsModal() {
             {section === "engines" && (
               <EnginesSettings />
             )}
+
+            {section === "voice" && <VoiceHandySection />}
+
+            {section === "selfModify" && <SelfModifySection />}
 
             {section === "backups" && <WorkspaceBackupSettings />}
 

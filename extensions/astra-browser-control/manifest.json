@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "Astra Browser Control",
+  "version": "0.1.0.0",
+  "description": "Enables Astra AI to directly control and interact with the Chrome browser. Provides navigation, clicking, typing, screenshot capture, and JavaScript execution capabilities.",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting",
+    "storage",
+    "alarms",
+    "contextMenus",
+    "notifications"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://localhost:*",
+    "ws://localhost:*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/astra-16.png",
+      "32": "icons/astra-32.png",
+      "48": "icons/astra-48.png",
+      "128": "icons/astra-128.png"
+    },
+    "default_title": "Astra Browser Control"
+  },
+  "icons": {
+    "16": "icons/astra-16.png",
+    "32": "icons/astra-32.png",
+    "48": "icons/astra-48.png",
+    "128": "icons/astra-128.png"
+  },
+  "options_page": "options.html",
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

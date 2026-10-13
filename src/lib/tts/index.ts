@@ -15,6 +15,7 @@
 // server-computed approval key.
 
 import { localSystemVoiceActive, remoteSystemVoice, resolveLocalSystemVoice } from "@/lib/local-voice";
+import { spokenReply } from "../../../shared/reply-sections";
 
 export type SpeechStatus = "idle" | "preparing" | "speaking";
 
@@ -176,7 +177,13 @@ export class Speaker {
     opts: SpeakOptions,
     live: () => boolean,
   ): Promise<void> {
-    const value = text.trim();
+    // This path never reaches the harness, so it asks the same question the
+    // harness route does instead of answering it again: speaking the whole
+    // reply through the device's own engine — the default on a paired desktop
+    // — would read a diff aloud, and a reply that is nothing but a leaked tool
+    // payload is not prose and stays silent. Both are decided in one place;
+    // this is a consumer of that decision, not a second owner of it.
+    const value = spokenReply(text);
     if (!value) {
       this.set(IDLE);
       return Promise.resolve();
@@ -215,12 +222,12 @@ export class Speaker {
       utterance.onend = () => finish(true);
       utterance.onerror = (event) => {
         const interrupted = event.error === "canceled" || event.error === "interrupted";
-        finish(false, interrupted ? undefined : "This Mac could not play its selected voice.");
+        finish(false, interrupted ? undefined : "This device could not play its selected voice.");
       };
       try {
         synth.speak(utterance);
       } catch {
-        finish(false, "This Mac could not start its selected voice.");
+        finish(false, "This device could not start its selected voice.");
       }
     });
   }

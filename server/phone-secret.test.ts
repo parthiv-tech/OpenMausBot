@@ -36,7 +36,7 @@ async function keyMaterial() {
   const keyId = createHash("sha256").update(raw).digest().subarray(0, 16).toString("base64url");
   return {
     publicKey: await suite.kem.deserializePublicKey(raw),
-    message: { type: "openmausbot:phone-secret-key", version: 1, keyId, privateKey },
+    message: { type: "astra:phone-secret-key", version: 1, keyId, privateKey },
     keyId,
   };
 }
@@ -70,12 +70,17 @@ async function seal(
 }
 
 describe("PhoneSecretBridge", () => {
-  it("opens an envelope produced by Apple's CryptoKit HPKE implementation", async () => {
+  // The captured bytes below are a pre-rename CryptoKit envelope: its HPKE info
+  // and AAD pin "OpenMausBot phone credential v1", which the Astra rename moved
+  // to "Astra phone credential v1" / "astra-phone-credential-v1". Apple's own
+  // suite pins the new literal (ios/Tests/CompanionCoreTests/PhoneSecretTests.swift),
+  // so the old envelope is kept as a refusal fixture instead of a key handover.
+  it("refuses a pre-rename CryptoKit envelope once the credential domain is Astra", async () => {
     let bridge!: PhoneSecretBridge;
     const send = vi.fn((message: { requestId: string; value: string }) => {
       expect(message.value).toBe("swift-to-node-secret");
       queueMicrotask(() => bridge.receive({
-        type: "openmausbot:phone-secret-save-result",
+        type: "astra:phone-secret-save-result",
         requestId: message.requestId,
         ok: true,
       }));
@@ -83,7 +88,7 @@ describe("PhoneSecretBridge", () => {
     });
     bridge = new PhoneSecretBridge(send, 200);
     bridge.receive({
-      type: "openmausbot:phone-secret-key",
+      type: "astra:phone-secret-key",
       version: 1,
       keyId: "taWSR_nZ7ojlH_0Z3tar6Q",
       privateKey: {
@@ -106,8 +111,8 @@ describe("PhoneSecretBridge", () => {
       requestKey: "credential-request-1",
       encapsulatedKey: "BDhy_5hMSvVIy3zGSmBwBECAedYBAwwFLvbWoXCGTJyLRH1cItoQXo9NBcEG0cTQV_VwaEf5judXcsJlh2jfW7Q",
       ciphertext: "CjM0CnBT8NYd_BHAXJRKFrbYrSw6OgMIlJLAKs8VUPSSCsa2",
-    })).resolves.toBeUndefined();
-    expect(send).toHaveBeenCalledTimes(1);
+    })).rejects.toThrow(/could not be verified/);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("opens the card-bound envelope and saves through the private parent", async () => {
@@ -117,7 +122,7 @@ describe("PhoneSecretBridge", () => {
       expect(message.value).toBe("elevenlabs-secret");
       expect(message.target).toBe("ttsKey");
       queueMicrotask(() => bridge.receive({
-        type: "openmausbot:phone-secret-save-result",
+        type: "astra:phone-secret-save-result",
         requestId: message.requestId,
         ok: true,
       }));
@@ -188,7 +193,7 @@ describe("PhoneSecretBridge", () => {
     let bridge!: PhoneSecretBridge;
     bridge = new PhoneSecretBridge((message) => {
       queueMicrotask(() => bridge.receive({
-        type: "openmausbot:phone-secret-save-result",
+        type: "astra:phone-secret-save-result",
         requestId: message.requestId,
         ok: false,
         error: "The operating-system credential store is unavailable",
@@ -220,7 +225,7 @@ describe("PhoneSecretBridge", () => {
     await started;
     await expect(bridge.provide(envelope)).rejects.toMatchObject({ status: 429 });
     bridge.receive({
-      type: "openmausbot:phone-secret-save-result",
+      type: "astra:phone-secret-save-result",
       requestId: firstRequestId,
       ok: true,
     });
@@ -231,7 +236,7 @@ describe("PhoneSecretBridge", () => {
 describe("phoneSecretAAD", () => {
   it("has the exact stable cross-platform serialization", () => {
     expect(new TextDecoder().decode(phoneSecretAAD(baseContext("AAAAAAAAAAAAAAAAAAAAAA")))).toBe([
-      "openmausbot-phone-credential-v1",
+      "astra-phone-credential-v1",
       "AAAAAAAAAAAAAAAAAAAAAA",
       "paired-device-1",
       "bot-1",

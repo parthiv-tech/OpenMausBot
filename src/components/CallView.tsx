@@ -18,19 +18,23 @@
 // it happens, which is why waiting feels like listening to someone work
 // rather than listening to nothing.
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { Loader2, Phone, PhoneOff, X } from "lucide-react";
+import { Phone, PhoneOff, X } from "lucide-react";
+import { ThinkingOrb } from "thinking-orbs";
 
 import { useStore, visibleMessages, type Bot } from "@/state/store";
 import { currentCall, deferCallCleanup, endCall, startCall, useOnCall } from "@/lib/call";
 import { speaker } from "@/lib/tts";
 import { localSystemVoiceActive } from "@/lib/local-voice";
 import { useSpeech } from "@/lib/tts/useSpeech";
-import { usePushToTalk } from "@/lib/push-to-talk";
+import { useCallTalk } from "@/lib/push-to-talk";
 import { BotAvatar } from "./Avatar";
 import { isRoutineApproval, isSkillApproval, pendingApprovals, spokenApprovalPrompt } from "./PendingApproval";
 import { cn } from "@/lib/cn";
 import { track } from "@/lib/analytics";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { createOfflineCallStt } from "@/lib/offline-call-stt";
+import { Liquid } from "liquid-gooey";
+import { MetalFx } from "metal-fx";
 
 /** Spoken answers to a permission card. Anything else is read as a reply
  * to the bot, not as consent — an approval must never be granted by a
@@ -74,7 +78,9 @@ export function CallTargetButton({
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
-  const supported = capabilities.dictation.available && Boolean(window.ogb?.speechStart);
+  const supported =
+    (capabilities.dictation.available && Boolean(window.ogb?.speechStart)) ||
+    Boolean(window.ogb?.handyTranscribeFile);
   const localVoice = localSystemVoiceActive();
   const configured = localVoice || Boolean(state.config?.tts?.configured);
   const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
@@ -92,7 +98,7 @@ export function CallTargetButton({
     : !capabilitiesReady
       ? "Checking call availability"
       : !supported
-        ? "Calls currently need the macOS desktop app"
+        ? "Calls need the desktop app with offline dictation"
         : !configured
           ? "Set up a voice in an agent profile to make calls"
           : !voiceReady
@@ -101,12 +107,10 @@ export function CallTargetButton({
 
   const reason = !capabilitiesReady
     ? "Checking whether this device can make calls."
-    : !capabilities.dictation.available
-      ? "Calls require OpenMausBot for macOS because speech recognition runs on-device."
-      : !window.ogb?.speechStart
-        ? "The speech service is unavailable in this app build. Restart or update OpenMausBot."
+    : !supported
+      ? "Offline calls need Handy. Set its path in Settings → Voice & Handy."
         : !configured
-          ? "Add an ElevenLabs API key — or switch to the built-in Mac voices — so the bot can speak during calls."
+          ? "Choose an offline Piper voice, a built-in Mac voice, or configure ElevenLabs for call playback."
           : !voiceReady
             ? voices.length > 1
               ? "Give every group member a voice before starting a group call."
@@ -197,6 +201,7 @@ export function CallOverlay({ bot }: { bot: Bot }) {
   return <Call bot={bot} />;
 }
 
+
 function Call({ bot }: { bot: Bot }) {
   const { dispatch } = useStore();
   const speech = useSpeech();
@@ -204,10 +209,17 @@ function Call({ bot }: { bot: Bot }) {
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [heard, setHeard] = useState("");
   const [note, setNote] = useState<string | null>(null);
-  const pushToTalk = usePushToTalk(bot.id, phase === "listening", () => {
-    setNote("Push to talk couldn't start. Check Microphone and Speech Recognition access.");
-  });
-
+  // The chrome ring and the liquid cluster are both motion. Under the OS
+  // reduced-motion preference the ring holds still and the pieces keep their
+  // places; the call itself must never depend on an animation.
+  const [reducedMotion, setReducedMotion] = useState(false);
+  useEffect(() => {
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const sync = () => setReducedMotion(query.matches);
+    sync();
+    query.addEventListener("change", sync);
+    return () => query.removeEventListener("change", sync);
+  }, []);
   const messages = visibleMessages(bot);
   const approval = pendingApprovals(messages)[0];
   const question = messages.find(
@@ -251,19 +263,115 @@ function Call({ bot }: { bot: Bot }) {
 
   const hush = useCallback(() => {
     void window.ogb?.speechStop();
+    // Keep microphone input muted throughout playback.
+    offlineSttRef.current?.setMuted(true);
   }, []);
+
+  const offlineSttRef = useRef<ReturnType<typeof createOfflineCallStt> | null>(null);
+  const stopOfflineStt = useCallback(() => {
+    offlineSttRef.current?.stop();
+    offlineSttRef.current = null;
+  }, []);
+  const ensureOfflineStt = useCallback(() => {
+    if (offlineSttRef.current) return offlineSttRef.current;
+    if (window.ogb?.platform === "darwin") return null; // Apple Speech's call
+    const session = createOfflineCallStt({
+      onUtterance: (said) => {
+        // Late decodes must not interrupt playback or submit another turn.
+        if (!alive.current || currentCall() !== bot.id || phaseRef.current !== "listening") return;
+        setHeard(said);
+        handleUtterance(said);
+      },
+      onError: (message) => {
+        if (alive.current && currentCall() === bot.id) setNote(message);
+      },
+    });
+    offlineSttRef.current = session;
+    return session;
+    // session callbacks close over refs only (alive, currentCall(), and
+    // the stable handleUtterance captured below); the deps list keeps the
+    // closure honest without re-creating the session every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bot.id]);
+
+  const talkStart = useCallback(() => {
+    if (!alive.current || currentCall() !== bot.id) return;
+    // An interruption is speech, not silence: cut the agent off in the same
+    // tick. Bumping the generation invalidates the in-flight say(), so the
+    // call cannot resume the sentence it was reading.
+    if (phaseRef.current === "speaking") {
+      sayGeneration.current += 1;
+      speaker.stop();
+    }
+    move("listening");
+    const offline = ensureOfflineStt();
+    if (offline) {
+      offline.setMuted(false);
+      // The user owns the end of this turn (the release finalizes it), so the
+      // silence endpointer must not ship a half sentence at the first pause.
+      offline.holdTurn(true);
+      void offline.start().catch((error: unknown) => {
+        if (!alive.current || currentCall() !== bot.id) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setNote(
+          /permission|denied/i.test(message)
+            ? "Microphone access was denied — allow it, then hold Space to talk."
+            : "The microphone couldn't start. Check Microphone access, then hold Space to talk.",
+        );
+      });
+      return;
+    }
+    void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+      if (alive.current && currentCall() === bot.id) {
+        setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
+      }
+    });
+  }, [bot.id, ensureOfflineStt, move]);
+
+  const talkEnd = useCallback(() => {
+    const offline = offlineSttRef.current;
+    if (offline) {
+      // finalize → onUtterance → handleUtterance sends the turn, exactly as an
+      // endpointed utterance would.
+      offline.finishTurn();
+      return;
+    }
+    void window.ogb?.speechFinish?.();
+  }, []);
+
+  // The talk key owns the space bar while this call is up: hold it to talk,
+  // and hold it during the agent's own sentence to cut that sentence off.
+  const talking = useCallTalk({
+    isCallLive: () => alive.current && currentCall() === bot.id,
+    onTalkStart: talkStart,
+    onTalkEnd: talkEnd,
+  });
 
   const listen = useCallback(() => {
     if (!alive.current || currentCall() !== bot.id) return;
     move("listening");
     setHeard("");
     setNote(null);
+    // Handy handles offline listening on non-macOS desktops.
+    const offline = ensureOfflineStt();
+    if (offline) {
+      offline.setMuted(false);
+      void offline.start().catch((error) => {
+        stopOfflineStt();
+        if (alive.current && currentCall() === bot.id) {
+          const message = error instanceof Error ? error.message : String(error);
+          setNote(/permission|denied/i.test(message) ? "Microphone access was denied — allow it, then call again." : message);
+        }
+      });
+      return;
+    }
+    // Native on-device recognition remains available on macOS.
     void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
       if (alive.current && currentCall() === bot.id) {
         setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
       }
     });
-  }, [bot.id, move]);
+  }, [bot.id, ensureOfflineStt, move, stopOfflineStt]);
 
   /** Speak, with the microphone closed for the duration (see the header
    * comment — an open mic during playback is a feedback loop). */
@@ -305,21 +413,9 @@ function Call({ bot }: { bot: Bot }) {
   }, [bot.id]);
 
   // ── the microphone ───────────────────────────────────────────────────
-  useEffect(() => {
-    const bridge = window.ogb;
-    if (!bridge) return;
-    const offTranscript = bridge.onSpeechTranscript((line) => {
-      if (!alive.current || currentCall() !== bot.id || phaseRef.current !== "listening") return;
-      if (line.error) {
-        setNote("Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
-        return;
-      }
-      if (typeof line.text !== "string") return;
-      setHeard(line.text);
-      if (line.partial !== false) return;
-      // final result — Apple's recognizer decided the turn ended
-      const said = line.text.trim();
-      if (!said) return listen();
+  const handleUtterance = useCallback(
+    (said: string) => {
+      setHeard(said);
 
       const open = askedApproval.current;
       if (open) {
@@ -382,11 +478,31 @@ function Call({ bot }: { bot: Bot }) {
 
       move("sending");
       dispatch({ type: "send", botId: bot.id, text: said, threadId: bot.threadId });
+    },
+    [bot.id, bot.threadId, dispatch, hush, move, sayThenListen],
+  );
+
+  useEffect(() => {
+    const bridge = window.ogb;
+    if (!bridge) return;
+    const offTranscript = bridge.onSpeechTranscript((line) => {
+      if (!alive.current || currentCall() !== bot.id || phaseRef.current !== "listening") return;
+      if (line.error) {
+        setNote("Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
+        return;
+      }
+      if (typeof line.text !== "string") return;
+      setHeard(line.text);
+      if (line.partial !== false) return;
+      // final result — Apple's recognizer decided the turn ended
+      const said = line.text.trim();
+      if (!said) return listen();
+      handleUtterance(said);
     });
     const offEnd = bridge.onSpeechEnd(({ code, reason }) => {
       if (!alive.current || currentCall() !== bot.id) return;
       if (code === 2) {
-        setNote("Calls need macOS dictation, which isn't available here yet.");
+        if (!offlineSttRef.current) setNote("Offline speech recognition is unavailable in this build.");
         return;
       }
       if (code === 1) {
@@ -407,11 +523,12 @@ function Call({ bot }: { bot: Bot }) {
       offTranscript();
       offEnd();
       void window.ogb?.speechStop();
+      stopOfflineStt();
     };
     // busy/approval are intentionally initial snapshots. Their live changes
     // are handled below without tearing down native event listeners.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bot.id, bot.threadId, dispatch, hush, listen, move, sayThenListen]);
+  }, [bot.id, bot.threadId, dispatch, handleUtterance, listen, move, stopOfflineStt]);
 
   // ── narrate the work, speak the answer, read the approvals ───────────
   useEffect(() => {
@@ -503,30 +620,26 @@ function Call({ bot }: { bot: Bot }) {
     }
   }, [bot.busy, hush, listen, move]);
 
-  // Escape hangs up; space interrupts whatever is being said
+  // Escape hangs up. The space bar is deliberately NOT handled here: useCallTalk
+  // owns it (hold to talk, hold during a sentence to interrupt), and two
+  // handlers on one key would both fire on the same press.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        endCall(bot.id);
-      } else if (e.code === "Space" && speaker.isSpeaking()) {
-        e.preventDefault();
-        sayGeneration.current += 1;
-        speaker.stop();
-        listen();
-      }
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      endCall(bot.id);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [bot.id, listen]);
+  }, [bot.id]);
 
   const mascotState =
     phase === "listening" ? "listening" : phase === "speaking" ? "sending" : phase === "sending" ? "thinking" : "working";
   const status =
     phase === "listening"
-      ? pushToTalk
-        ? "Push to talk"
-        : "Listening"
+      ? talking
+        ? "Talking — release Space to send"
+        : "Listening — hold Space to talk"
       : phase === "sending"
         ? "One moment"
         : phase === "speaking"
@@ -548,7 +661,11 @@ function Call({ bot }: { bot: Bot }) {
       <div className="flex flex-col items-center gap-1.5 text-center">
         <div className="text-[20px] font-medium text-ink">{bot.name}</div>
         <div className="flex items-center gap-2 text-[13.5px] text-ink-secondary">
-          {(phase === "working" || phase === "sending") && <Loader2 size={13} className="animate-spin" />}
+          {phase === "sending" || phase === "working" ? (
+            <ThinkingOrb state={phase === "sending" ? "connecting" : "searching"} size={20} />
+          ) : phase === "listening" && heard ? (
+            <ThinkingOrb state="listening" size={20} />
+          ) : null}
           {status}
         </div>
       </div>
@@ -558,7 +675,7 @@ function Call({ bot }: { bot: Bot }) {
         {phase === "listening" ? (
           heard || (
             <span className="text-ink-secondary">
-              {pushToTalk ? "Release Control + Option to send…" : "Say something…"}
+              {talking ? "Release Space to send…" : "Say something… hold Space to talk"}
             </span>
           )
         ) : (
@@ -579,29 +696,59 @@ function Call({ bot }: { bot: Bot }) {
       )}
       {speech.error && <div className="max-w-[420px] text-center text-[12.5px] text-danger">{speech.error}</div>}
 
-      <div className="flex items-center gap-3">
+      {/* The call's controls as one liquid mass: pieces merge where they meet,
+          and the talk pill — the gesture that actually drives the call — wears
+          the chrome ring. `strength` tracks the talk state so the ring is lit
+          while the user is speaking and dim when the agent has the floor. */}
+      <Liquid
+        blur={6}
+        contrast={18}
+        fill="var(--color-panel)"
+        shadow="0 2px 10px rgba(0,0,0,.45)"
+        className="flex items-center gap-2.5"
+      >
         {speaker.isSpeaking() && (
-          <button
-            onClick={() => {
-              sayGeneration.current += 1;
-              speaker.stop();
-              listen();
-            }}
-            className="rounded-full border border-hairline/50 px-4 py-2 text-[13.5px] text-ink hover:bg-raised"
-          >
-            Interrupt
-          </button>
+          <Liquid.Item transition="bouncy">
+            <button
+              onClick={() => {
+                sayGeneration.current += 1;
+                speaker.stop();
+                listen();
+              }}
+              className="rounded-full border border-hairline/50 px-4 py-2 text-[13.5px] text-ink hover:bg-raised"
+            >
+              Interrupt
+            </button>
+          </Liquid.Item>
         )}
-        <button
-          onClick={() => endCall(bot.id)}
-          className="flex items-center gap-2 rounded-full bg-danger px-5 py-2.5 text-[14px] font-medium text-white hover:brightness-110"
-        >
-          <PhoneOff size={16} /> Hang up
-        </button>
-      </div>
+        <Liquid.Item transition="bouncy" delay={40}>
+          <MetalFx
+            variant="button"
+            preset="chromatic"
+            strength={talking ? 1 : 0.35}
+            paused={reducedMotion}
+            className="rounded-full"
+          >
+            <div
+              aria-live="polite"
+              className={cn("px-5 py-2.5 text-[13.5px]", talking ? "text-ink" : "text-ink-secondary")}
+            >
+              {talking ? "Talking — release Space" : "Hold Space to talk"}
+            </div>
+          </MetalFx>
+        </Liquid.Item>
+        <Liquid.Item transition="bouncy" delay={80}>
+          <button
+            onClick={() => endCall(bot.id)}
+            className="flex items-center gap-2 rounded-full bg-danger px-5 py-2.5 text-[14px] font-medium text-white hover:brightness-110"
+          >
+            <PhoneOff size={16} /> Hang up
+          </button>
+        </Liquid.Item>
+      </Liquid>
 
       <div className="text-[11.5px] text-ink-secondary/70">
-        Hold Control + Option to talk · Space interrupts · Esc hangs up
+        Hold Space to talk · Space also interrupts · Esc hangs up
       </div>
     </div>
   );

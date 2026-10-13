@@ -5,6 +5,12 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { AppConfig } from "../config.ts";
+import { piperInstallable, piperTarget } from "./piper-install.ts";
+import { piperAvailable } from "./piper.ts";
+
+/** The one-click install is offered where a pinned engine exists for this
+ * platform and architecture — same idea as `onBuiltInPlatform` below. */
+const onInstallablePlatform = piperInstallable(piperTarget());
 
 let server: Server;
 /** every request the stub saw, so tests can assert on what we sent */
@@ -49,7 +55,7 @@ beforeAll(async () => {
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as { port: number }).port;
-  process.env.OMB_ELEVENLABS_API = `http://127.0.0.1:${port}/v1`;
+  process.env.ASTRA_ELEVENLABS_API = `http://127.0.0.1:${port}/v1`;
 });
 
 afterAll(() => new Promise<void>((r) => server.close(() => r())));
@@ -74,7 +80,19 @@ describe("configuration", () => {
   it("never reports the key itself", async () => {
     const { describeVoice } = await voice();
     const described = describeVoice(cfg({ key: "sk-secret", voice: "v-1" }));
-    expect(described).toEqual({ configured: true, ready: true, voice: "v-1", provider: "elevenlabs" });
+    // piperAvailable and the install fields ride along so Settings can grey out
+    // the offline engine, offer the one-click install and show its progress
+    // before the user asks for any of it; the key itself never does.
+    expect(described).toEqual({
+      configured: true,
+      ready: true,
+      voice: "v-1",
+      provider: "elevenlabs",
+      piperAvailable: false,
+      piperInstallable: onInstallablePlatform,
+      piperInstalling: false,
+      piperInstallError: null,
+    });
     expect(JSON.stringify(described)).not.toContain("sk-secret");
   });
 
@@ -187,19 +205,25 @@ describe("built-in macOS voices", () => {
   };
 
   const system = { provider: "system" as const, voice: "Albert" };
-  const onMac = process.platform === "darwin";
+  // The built-in engine exists on macOS (`say`) and Windows (SAPI) alike;
+  // the runner seam below mimics `say` on every platform.
+  const onBuiltInPlatform = process.platform === "darwin" || process.platform === "win32";
 
   it("needs no key — only a picked voice — once selected", async () => {
     const { voiceConfigured, voiceReady, describeVoice } = await voice();
-    expect(voiceConfigured(cfg(system))).toBe(onMac);
-    expect(voiceReady(cfg({ provider: "system" }), "Albert")).toBe(onMac);
-    expect(voiceReady(cfg(system))).toBe(onMac);
+    expect(voiceConfigured(cfg(system))).toBe(onBuiltInPlatform);
+    expect(voiceReady(cfg({ provider: "system" }), "Albert")).toBe(onBuiltInPlatform);
+    expect(voiceReady(cfg(system))).toBe(onBuiltInPlatform);
     const described = describeVoice(cfg(system));
     expect(described).toEqual({
-      configured: onMac,
-      ready: onMac,
+      configured: onBuiltInPlatform,
+      ready: onBuiltInPlatform,
       voice: "Albert",
       provider: "system",
+      piperAvailable: false,
+      piperInstallable: onInstallablePlatform,
+      piperInstalling: false,
+      piperInstallError: null,
     });
   });
 
@@ -238,5 +262,53 @@ describe("built-in macOS voices", () => {
     expect(() => speak(cfg({ provider: "system" }), "hi", undefined, fakeSay([]))).toThrow(
       "Pick a voice in the agent profile.",
     );
+  });
+});
+
+describe("Piper (offline neural voices)", () => {
+  // The vitest home is a throwaway directory (server/testing/setup.ts), so
+  // the engine is never provisioned here; these tests hold the contract that
+  // matters on machines without it — selected-but-absent stays honest.
+  const unavailable = !piperAvailable();
+
+  it("reports a selected Piper provider even when the engine is absent", async () => {
+    const { voiceProvider } = await voice();
+    expect(voiceProvider(cfg({ provider: "piper", voice: "en_US-amy-medium" }))).toBe("piper");
+    // and an unset provider is still ElevenLabs
+    expect(voiceProvider(cfg({ key: "k", voice: "v" }))).toBe("elevenlabs");
+  });
+
+  it("refuses to speak with Piper-shaped advice, not ElevenLabs advice", async () => {
+    const { speak, NoVoiceConfigured } = await voice();
+    const attempt = () => speak(cfg({ provider: "piper", voice: "en_US-amy-medium" }), "hi");
+    expect(attempt).toThrow(NoVoiceConfigured);
+    try {
+      attempt();
+      expect.unreachable("speak should have thrown");
+    } catch (error) {
+      const message = (error as Error).message;
+      if (unavailable) {
+        // the engine is missing HERE: the advice must say so, and must not
+        // point at ElevenLabs — the user picked the offline engine
+        expect(message).toMatch(/Piper/);
+        expect(message).not.toMatch(/ElevenLabs/);
+      }
+    }
+  });
+
+  it("counts as unconfigured while the engine is absent", async () => {
+    const { voiceConfigured, voiceReady, providerConfigured } = await voice();
+    if (!unavailable) return; // provisioned home: availability gates below still hold
+    const selected = { provider: "piper" as const, voice: "en_US-amy-medium" };
+    expect(providerConfigured(cfg(selected))).toBe(false);
+    expect(voiceConfigured(cfg(selected))).toBe(false);
+    expect(voiceReady(cfg(selected))).toBe(false);
+  });
+
+  it("lists voices through the piper module only when the engine exists", async () => {
+    const { listVoices } = await voice();
+    const voices = await listVoices(cfg({ provider: "piper" }));
+    if (unavailable) expect(voices).toEqual([]);
+    else expect(voices.length).toBeGreaterThan(0);
   });
 });

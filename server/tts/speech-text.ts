@@ -11,6 +11,11 @@
 // becomes "a code block" — the user is looking at the screen if they care,
 // and this is the half of the feature that decides whether it is pleasant.
 //
+// None of that decides which half of a reply is read aloud; that is the
+// section convention in `shared/reply-sections.ts`, whose `spokenReply` is
+// re-exported at the foot of this module. This module is the part that makes
+// whatever it is handed bearable.
+//
 // Pure and synchronous on purpose: it is the piece most likely to need
 // tuning against real transcripts, so it stays trivially testable.
 

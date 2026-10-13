@@ -27,6 +27,7 @@ import { customMcpServers,
   browserProfilePartitionTarget,
   browserProfileReplacementConflict,
   browserProfileRoutingConflict,
+  botChromeExecutablePath,
   stripWorkspaceCredentialEnv,
   syncCredentialEnv,
   vpsSshAlias,
@@ -54,9 +55,9 @@ describe("configuration boundaries", () => {
     expect(parseStoredConfig({ imageGen: { key: "legacy" } }).imageGen).toEqual({ key: "legacy" });
     expect(() => parseConfigPatch({ imageGen: { provider: "unknown" } })).toThrow("provider");
     expect(() => parseConfigPatch({ imageGen: { customUrl: "https://user:secret@router.example/v1" } })).toThrow("customUrl");
-    const childEnv = { OMB_CUSTOM_IMAGE_KEY: "must-not-reach-bot" };
+    const childEnv = { ASTRA_CUSTOM_IMAGE_KEY: "must-not-reach-bot" };
     stripWorkspaceCredentialEnv(childEnv);
-    expect(childEnv).not.toHaveProperty("OMB_CUSTOM_IMAGE_KEY");
+    expect(childEnv).not.toHaveProperty("ASTRA_CUSTOM_IMAGE_KEY");
   });
   it("persists a custom domain but excludes it from generic config patches", () => {
     expect(parseStoredConfig({ customDomain: "https://bots.example.com" })).toEqual({ customDomain: "https://bots.example.com" });
@@ -525,6 +526,34 @@ describe("default fleet", () => {
     expect(map.hermes?.driver).toBe("hermesAgent");
     expect(map.cursor?.driver).toBe("cursorAgent");
     expect(map.openaiCompat?.driver).toBe("openai-compat");
+    expect(map.vision?.driver).toBe("vision");
+  });
+
+  it("carries the saved Vision endpoint into the live default instance", () => {
+    const map = instanceConfigs({
+      vision: { key: "secret", url: "https://proxy.example.test/v1" },
+    });
+    expect(map.vision.config).toEqual({ url: "https://proxy.example.test/v1" });
+    expect(map.vision.environment).toEqual({
+      FREELLMAPI_API_KEY: "secret",
+      VISION_URL: "https://proxy.example.test/v1",
+    });
+  });
+
+  it("preserves a per-instance Vision url override", () => {
+    const map = instanceConfigs({
+      vision: { url: "https://workspace.example.test/v1" },
+      instances: {
+        customVision: {
+          driver: "vision",
+          config: { url: "https://instance.example.test/v1", apiKeyEnv: "CUSTOM_KEY" },
+        },
+      },
+    });
+    expect(map.customVision.config).toEqual({
+      url: "https://instance.example.test/v1",
+      apiKeyEnv: "CUSTOM_KEY",
+    });
   });
 
   it("does not expand a one-off shadow fleet", () => {
@@ -740,12 +769,17 @@ describe("credential env preference", () => {
     "XAI_API_KEY",
     "OPENAI_COMPAT_API_KEY",
     "OPENAI_COMPAT_URL",
+    "FREELLMAPI_API_KEY",
+    "VISION_URL",
+    "VISION_MODEL",
     "OPENAI_COMPAT_MODEL",
     "OPENAI_COMPAT_PROVIDER",
     "BOX_TOKEN",
     "OPENCODE_API_KEY",
-    "OMB_TTS_KEY",
-    "OMB_OPENAI_IMAGE_KEY",
+    "ASTRA_TTS_KEY",
+    "ASTRA_DICTATION_KEY",
+    "ASTRA_PICOVOICE_KEY",
+    "ASTRA_OPENAI_IMAGE_KEY",
     "COMPOSIO_API_KEY",
   ] as const;
   let saved: Record<string, string | undefined>;
@@ -762,6 +796,39 @@ describe("credential env preference", () => {
       else process.env[name] = saved[name];
     }
     rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("ignores retired dictation config/env while preserving supported voice credentials", () => {
+    const path = join(DATA_DIR, "config.json");
+    const legacy = { dictation: { key: "fixture-legacy-file" } };
+    writeFileSync(path, JSON.stringify(legacy));
+    process.env.ASTRA_DICTATION_KEY = "fixture-legacy-env";
+    process.env.ASTRA_PICOVOICE_KEY = "fixture-wake-env";
+    process.env.ASTRA_TTS_KEY = "fixture-tts-env";
+    expect(parseStoredConfig(legacy)).toEqual({});
+    const patch = parseConfigPatch({
+      dictation: { key: "fixture-new-ignored" },
+      wakeWord: { accessKey: "fixture-wake-new" },
+      tts: { key: "fixture-tts-new", provider: "system" },
+    });
+    expect(patch).not.toHaveProperty("dictation");
+    expect(loadConfig()).not.toHaveProperty("dictation");
+    expect(loadConfig().wakeWord?.accessKey).toBe("fixture-wake-env");
+    expect(loadConfig().tts?.key).toBe("fixture-tts-env");
+    saveConfig(patch);
+    syncCredentialEnv(patch);
+    expect(process.env.ASTRA_DICTATION_KEY).toBe("fixture-legacy-env");
+    expect(loadConfig().wakeWord?.accessKey).toBe("fixture-wake-new");
+    expect(loadConfig().tts).toMatchObject({ key: "fixture-tts-new", provider: "system" });
+    // Unknown raw stored fields survive unrelated saves, but are never live config.
+    expect(JSON.parse(readFileSync(path, "utf8")).dictation).toEqual(legacy.dictation);
+    expect(loadConfig()).not.toHaveProperty("dictation");
+    const childEnv = { ASTRA_DICTATION_KEY: "fixture-legacy-env", PATH: "keep" };
+    stripWorkspaceCredentialEnv(childEnv);
+    expect(childEnv).toEqual({ PATH: "keep" });
+    rmSync(path);
+    saveConfig(parseConfigPatch({ dictation: { key: "fixture-new-ignored" } }));
+    expect(JSON.parse(readFileSync(path, "utf8"))).not.toHaveProperty("dictation");
   });
 
   it("prefers env over the config file for every credential", () => {
@@ -781,8 +848,8 @@ describe("credential env preference", () => {
     process.env.XAI_API_KEY = "env-xai";
     process.env.BOX_TOKEN = "env-box";
     process.env.OPENCODE_API_KEY = "env-ocg";
-    process.env.OMB_TTS_KEY = "env-tts";
-    process.env.OMB_OPENAI_IMAGE_KEY = "env-image";
+    process.env.ASTRA_TTS_KEY = "env-tts";
+    process.env.ASTRA_OPENAI_IMAGE_KEY = "env-image";
     const cfg = loadConfig();
     expect(cfg.xai).toEqual({ key: "env-xai", url: "https://api.example.test/v1" });
     expect(cfg.box).toEqual({ token: "env-box" });
@@ -949,7 +1016,7 @@ describe("credential env preference", () => {
     expect(process.env.XAI_API_KEY).toBe("just-saved");
     expect(process.env.COMPOSIO_API_KEY).toBe("ak_just_saved");
     expect(process.env.BOX_TOKEN).toBeUndefined();
-    expect(process.env.OMB_TTS_KEY).toBeUndefined();
+    expect(process.env.ASTRA_TTS_KEY).toBeUndefined();
   });
 
   it("syncCredentialEnv keeps model and provider env in step with a save", () => {
@@ -996,11 +1063,12 @@ describe("workspace credential env strip", () => {
   it("covers in-process secrets and private app-state paths", () => {
     // These secrets have no per-driver ACP allowlist entry anywhere — they are
     // consumed in-process (Computer driver / voice module), never by a CLI
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("FREELLMAPI_API_KEY");
     expect(WORKSPACE_CREDENTIAL_ENV).toContain("BOX_TOKEN");
-    expect(WORKSPACE_CREDENTIAL_ENV).toContain("OMB_TTS_KEY");
-    expect(WORKSPACE_CREDENTIAL_ENV).toContain("OMB_OPENAI_IMAGE_KEY");
-    expect(WORKSPACE_CREDENTIAL_ENV).toContain("OMB_BROWSER_CONNECTION");
-    expect(WORKSPACE_CREDENTIAL_ENV).toContain("OMB_USER_DATA");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("ASTRA_TTS_KEY");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("ASTRA_OPENAI_IMAGE_KEY");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("ASTRA_BROWSER_CONNECTION");
+    expect(WORKSPACE_CREDENTIAL_ENV).toContain("ASTRA_USER_DATA");
   });
 });
 
@@ -1084,5 +1152,30 @@ describe("providerReloadKeys", () => {
     expect(providerReloadKeys({ claude: { model: "x" }, profile: { name: "me" } })).toEqual(["claude"]);
     expect(providerReloadKeys({ onboarding: { hintsSeen: ["tour.composer"] } })).toEqual([]);
     expect(providerReloadKeys({ profile: {}, language: "de", tts: {}, features: {} })).toEqual([]);
+  });
+});
+
+describe("botChromeExecutablePath", () => {
+  it("uses the configured Chrome only while the path exists, else the managed one", () => {
+    const configured = { browser: { chromePath: "C:\\Chrome\\chrome.exe" } };
+    expect(botChromeExecutablePath(configured, { exists: () => true })).toEqual({
+      source: "configured",
+      path: "C:\\Chrome\\chrome.exe",
+    });
+    // A vanished path (update, uninstall) fails soft instead of breaking bots.
+    expect(botChromeExecutablePath(configured, { exists: () => false })).toEqual({ source: "managed" });
+    expect(botChromeExecutablePath({}, { exists: () => true })).toEqual({ source: "managed" });
+    expect(botChromeExecutablePath({ browser: {} }, { exists: () => true })).toEqual({ source: "managed" });
+    // Blank strings never count as a configuration.
+    expect(botChromeExecutablePath({ browser: { chromePath: "   " } }, { exists: () => true })).toEqual({
+      source: "managed",
+    });
+  });
+
+  it("accepts a chromePath in a config patch and keeps it trimmed-optional", () => {
+    const patch = parseConfigPatch({ browser: { chromePath: " C:\\Chrome\\chrome.exe " } });
+    expect(patch.browser?.chromePath).toBe(" C:\\Chrome\\chrome.exe ");
+    expect(parseConfigPatch({ browser: {} }).browser).toEqual({});
+    expect(() => parseConfigPatch({ browser: { chromePath: 42 } })).toThrow();
   });
 });

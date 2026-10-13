@@ -1,10 +1,12 @@
-// OpenMausBot server — the harness host. Clients hold no transports
+// Astra server — the harness host. Clients hold no transports
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
+import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, unlinkSync, utimesSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { extname, join } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { z } from "zod";
 import { botAvatarUrlFromStoredPath } from "../shared/bot-avatar.ts";
@@ -83,7 +85,7 @@ import {
 import * as composio from "./composio.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { peerAllowed, peerName, peerRosterSystemPrompt, reachablePeers, roomPeerRosterSystemPrompt, roomRosterLine } from "./peer-roster.ts";
-import { openMausStatusSystemPrompt } from "./openmaus-status-capsule.ts";
+import { astraStatusSystemPrompt } from "./astra-status-capsule.ts";
 import {
   containerComputerAction,
   containerComputerExists,
@@ -124,6 +126,8 @@ import {
   EVENTS_DIR,
   NATIVE_DIR,
   customMcpServers,
+  selfModifyEnabled,
+  botChromeExecutablePath,
 } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { MAX_REMOTE_COMMAND_LENGTH } from "./remote-computer.ts";
@@ -142,6 +146,7 @@ import {
   type ModelSelection,
   type RequestOutcome,
   type RuntimeEvent,
+  type TurnStartResult,
   newId,
 } from "./contracts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
@@ -203,6 +208,7 @@ import {
 } from "./send-idempotency.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
+import { primeRemoteCatalog, refreshRemoteCatalog, remoteCatalogIsStale } from "./model-catalog-remote.ts";
 import { selectDefaultModelSelection } from "./default-model-selection.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import { peerProvenanceNote, withPeerProvenance } from "./peer-provenance.ts";
@@ -220,7 +226,9 @@ import {
   type TaskRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
+import * as piperInstall from "./tts/piper-install.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
+import { spokenReply } from "../shared/reply-sections.ts";
 import { buildRecoveryText, buildTurnContext, engineIsFresh } from "./turn-context.ts";
 import { extractTurnImages } from "./turn-images.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
@@ -280,7 +288,25 @@ import {
   stageSkillWrite,
 } from "./skills.ts";
 import { fetchSkillFromSource } from "./skill-fetch.ts";
+import { BUILT_IN_PRESETS, fetchPromptsFromSource, presetWire, PROMPT_COLLECTIONS } from "./prompt-presets.ts";
+import { distillPrompts, META_SOURCE_PREFIX } from "./prompt-distill.ts";
+import {
+  applyPending,
+  discardPending,
+  failStartupCheck,
+  listJournal,
+  listPending,
+  markProposalForBoot,
+  reconcileAbandonedProposals,
+  revertProposal,
+  settleProposal,
+  submitProposal,
+  verifyBootedProposal,
+  writeJournal,
+  type JournalEntry,
+} from "./self-modify.ts";
 import { expandLearnTurnText, learnSource } from "./skill-learn.ts";
+import { buildApiToolbox } from "./api-toolbox.ts";
 import { expandSetupTurnText, setupModeActive, setupSystemPrompt } from "./setup-mode.ts";
 import type { SkillRequestCardData } from "../shared/skill-request.ts";
 import { checkSoulDrift, readSoulDrift, soulFile, writeSoulMirror } from "./bot-folder.ts";
@@ -395,11 +421,11 @@ import {
   type PhoneSecretContext,
 } from "./phone-secret.ts";
 
-const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
-const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
+const PORT = Number(process.env.ASTRA_PORT || process.env.OGB_PORT || 8799);
+const WEBHOOK_PORT = Number(process.env.ASTRA_WEBHOOK_PORT || PORT + 1);
 // Behind a proxy or tunnel, the base URL senders should use (docs/self-hosting.md).
-const WEBHOOK_PUBLIC_URL = process.env.OMB_WEBHOOK_PUBLIC_URL || undefined;
-const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
+const WEBHOOK_PUBLIC_URL = process.env.ASTRA_WEBHOOK_PUBLIC_URL || undefined;
+const STATIC_DIR = process.env.ASTRA_STATIC_DIR || null;
 const MIME: Record<string, string> = {
   ".html": "text/html",
   ".js": "text/javascript",
@@ -440,20 +466,95 @@ if (existsSync(join(DATA_DIR, ".backups"))) {
 }
 const workspaceMaintenance = new WorkspaceBackupMaintenance();
 // Only after ensureDirs(): it performs the one-time rename of the legacy data
-// dir, which must not find a freshly created ~/.openmausbot already there.
+// dir, which must not find a freshly created ~/.astra already there.
 // Remote clients (server/request-auth.ts, server/sessions.ts): a stable identity
 // for this server, the paired sessions, and the cookie the served UI uses.
 const ENVIRONMENT_ID = loadEnvironmentId(DATA_DIR);
 const sessions = new SessionRegistry({ file: join(DATA_DIR, "sessions.json") });
 const SESSION_COOKIE = sessionCookieName(PORT, ENVIRONMENT_ID);
-const DESKTOP_MANAGED = process.env.OMB_DESKTOP_PARENT === "1";
+const DESKTOP_MANAGED = process.env.ASTRA_DESKTOP_PARENT === "1";
 // Empty is deliberately a deny-all bootstrap state. Only Electron's private
 // utility-process port can replace it with the per-launch owner capability.
 let desktopMutationToken: string | undefined = DESKTOP_MANAGED ? "" : undefined;
 let companionMutationToken: string | undefined = DESKTOP_MANAGED ? "" : undefined;
 // Where remote clients reach this server (a proxy's public address); pairing URLs use it.
-const FALLBACK_PUBLIC_URL = process.env.OMB_PUBLIC_URL?.trim().replace(/\/+$/, "") || null;
+const FALLBACK_PUBLIC_URL = process.env.ASTRA_PUBLIC_URL?.trim().replace(/\/+$/, "") || null;
 const cfg = loadConfig();
+
+// ── self-modify trial boot ───────────────────────────────────────
+// Disk may hold an `applied` proposal from a previous run (a runtime apply
+// keeps the old code in memory; the NEXT boot is the trial). This runs as
+// early as possible so the marker + detached watchdog cover the whole
+// risky window: if THIS boot cannot parse, initialize, or bind — the
+// watchdog reverts; if it dies in a handled failure below,
+// failStartupCheck reverts; if it serves, the listener callback verifies.
+if (selfModifyEnabled(cfg)) {
+  const pendingTrial = listJournal().find((entry) => entry.status === "applied");
+  if (pendingTrial) {
+    markProposalForBoot(pendingTrial);
+    spawnDetachedSelfModifyWatchdog(pendingTrial);
+    console.log(`self-modify: trial boot for "${pendingTrial.proposal.id}" — reverting on crash, wedge, or failed boot`);
+  }
+  const abandoned = reconcileAbandonedProposals();
+  for (const id of abandoned) console.log(`self-modify: reverted unverified proposal "${id}" from a previous run`);
+  // Heartbeat: the watchdog reads the marker's mtime; a stalled mtime with
+  // a live pid means the event loop wedged. Best-effort by design.
+  const selfModifyHeartbeat = setInterval(() => {
+    try {
+      const marker = join(DATA_DIR, "self-modify", "boot-marker.json");
+      if (existsSync(marker)) utimesSync(marker, new Date(), new Date());
+    } catch {
+      // a missed beat is not fatal; staleness is judged over 60s
+    }
+  }, 15_000);
+  selfModifyHeartbeat.unref();
+}
+
+/** Spawn the detached stability watchdog for a trial boot. Detached +
+ * unref'd: it must outlive this process even if this process is killed
+ * -9, and it must never hold the event loop open. */
+function spawnDetachedSelfModifyWatchdog(entry: JournalEntry): void {
+  try {
+    const script = join(resolve(dirname(fileURLToPath(import.meta.url)), ".."), "electron", "self-modify-watchdog.mjs");
+    if (!existsSync(script)) {
+      console.warn("self-modify: watchdog script missing — trial boot runs without a crash watcher");
+      return;
+    }
+    const journalFile = join(DATA_DIR, "self-modify", "journal", `${entry.proposal.id}.json`);
+    const child = spawn(
+      process.execPath,
+      [script, journalFile, DATA_DIR, String(process.pid), resolve(dirname(fileURLToPath(import.meta.url)), "..")],
+      { detached: true, stdio: "ignore", windowsHide: true },
+    );
+    child.unref();
+  } catch (error) {
+    console.warn(`self-modify: could not spawn watchdog: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// A boot failure under a live proposal must leave the originals restored.
+// The guard is installed only for the trial window and removed once the
+// listener verifies — the server's own crash semantics are untouched
+// afterward. The rethrow lands on the next tick so the revert completes
+// before the process dies with its original stack.
+let selfModifyBootGuard: ((error: Error) => void) | null = null;
+if (selfModifyEnabled(cfg) && listJournal().some((entry) => entry.status === "applied")) {
+  selfModifyBootGuard = (error: Error) => {
+    process.off("uncaughtException", selfModifyBootGuard!);
+    selfModifyBootGuard = null;
+    try {
+      failStartupCheck(`boot crashed before serving: ${error.message}`);
+      console.error(`self-modify: boot crashed with the proposal applied — originals restored; re-crashing`, error);
+    } catch (revertError) {
+      console.error(`self-modify: boot-crash revert failed: ${revertError instanceof Error ? revertError.message : String(revertError)}`);
+    }
+    setImmediate(() => {
+      throw error;
+    });
+  };
+  process.on("uncaughtException", selfModifyBootGuard);
+}
+
 const customDomainVerifier = createCustomDomainVerifier({ environmentId: ENVIRONMENT_ID });
 // "Sign in with your email" on /pair: the allow-list is read per call so a
 // Settings change or an env bootstrap applies without a restart.
@@ -498,6 +599,12 @@ function noteTurnTrigger(threadId: string, auth: RequestAuth): void {
 }
 const providerAuthSessions = new ProviderAuthSessions();
 await registry.load(instanceConfigs(cfg));
+// The GitHub-backed catalog (models.dev) is only ever a fallback for an engine
+// whose own probe comes back empty. Priming reads the cache on disk and the
+// fetch runs in the background, so boot never waits on GitHub and an
+// unreachable host changes nothing about how the fleet starts.
+primeRemoteCatalog();
+if (remoteCatalogIsStale()) void refreshRemoteCatalog().catch(() => {});
 const bundledSkills = loadBundledSkills();
 const availableSkills = () => mergeSkills(bundledSkills, loadUserSkills(join(DATA_DIR, "skills")));
 
@@ -513,11 +620,11 @@ type UtilityParentPort = {
 // supplies parentPort; plain Node intentionally leaves it absent.
 const utilityParentPort = (process as NodeJS.Process & { parentPort?: UtilityParentPort }).parentPort;
 type DesktopPrivateMessage = BrowserCleanupWireRequest | {
-  type: "openmausbot:browser-control";
+  type: "astra:browser-control";
   botId: string;
   held: true;
 } | {
-  type: "openmausbot:phone-secret-save";
+  type: "astra:phone-secret-save";
   requestId: string;
   target: string;
   value: string;
@@ -551,7 +658,7 @@ function postDesktopPrivateMessage(message: DesktopPrivateMessage): boolean {
 function applyDesktopMutationTokenMessage(raw: unknown): boolean {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
   const message = raw as Record<string, unknown>;
-  if (message.type !== "openmausbot:desktop-mutation-token") return false;
+  if (message.type !== "astra:desktop-mutation-token") return false;
   if (typeof message.token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(message.token)) {
     throw new Error("invalid desktop mutation capability");
   }
@@ -570,7 +677,7 @@ const browserCleanup: BrowserCleanupCoordinator = new BrowserCleanupCoordinator(
     const status = browserEngineStatus();
     // Guest sessions are throwaway and never saved, so only the bot's own
     // session and shared profile sessions have state to clear.
-    const sessions = request.type === "openmausbot:browser-bot-deleted" && request.botId
+    const sessions = request.type === "astra:browser-bot-deleted" && request.botId
       ? [browserSessionId(request.botId, "")]
       : request.partitionId
         ? [browserSessionId("", request.partitionId)]
@@ -580,7 +687,7 @@ const browserCleanup: BrowserCleanupCoordinator = new BrowserCleanupCoordinator(
     const work = status.kind === "ready" && sessions.length
       ? Promise.all(sessions.map(async (session) => {
           const ok = await clearBrowserSessionState(status.binaryPath, session, { encryptionKey: browserEngineEncryptionKey() });
-          if (!ok) console.warn(`browser cleanup: could not clear saved state for session ${session}; restart OpenMausBot to retry this profile's cleanup. Do not use state clear --all: it erases other profiles too.`);
+          if (!ok) console.warn(`browser cleanup: could not clear saved state for session ${session}; restart Astra to retry this profile's cleanup. Do not use state clear --all: it erases other profiles too.`);
           return ok;
         }))
       : Promise.resolve([true]);
@@ -588,7 +695,7 @@ const browserCleanup: BrowserCleanupCoordinator = new BrowserCleanupCoordinator(
       console.warn("browser cleanup: could not clear saved session state", error);
       return false;
     }).then((ok) => {
-      browserCleanup.receive({ type: "openmausbot:browser-lifecycle-result", requestId: request.requestId, ok });
+      browserCleanup.receive({ type: "astra:browser-lifecycle-result", requestId: request.requestId, ok });
     }).catch((error) => {
       console.warn("browser cleanup: could not acknowledge cleanup", error);
     });
@@ -781,12 +888,13 @@ function agentsIntegration(
     args: [agentsProxyPath],
     env: {
       ...AGENTS_NODE_FLAG,
-      OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
-      OMB_BOT_ID: botId,
-      OMB_THREAD_ID: threadId,
-      OMB_COMMS_TOKEN: token,
-      OMB_TURN_DEPTH: String(depth),
-      OMB_SKILL_AUTHORING_ENABLED: skillAuthoring ? "1" : "0",
+      ASTRA_HARNESS_URL: `http://127.0.0.1:${PORT}`,
+      ASTRA_BOT_ID: botId,
+      ASTRA_THREAD_ID: threadId,
+      ASTRA_COMMS_TOKEN: token,
+      ASTRA_TURN_DEPTH: String(depth),
+      ASTRA_SKILL_AUTHORING_ENABLED: skillAuthoring ? "1" : "0",
+      ASTRA_SELF_MODIFY_ENABLED: selfModifyEnabled(cfg) ? "1" : "0",
     },
   };
 }
@@ -1030,12 +1138,17 @@ async function browserIntegration(botId: string, profile: string | undefined, tu
   const profileTarget = profile && profile !== "guest" ? browserProfilePartitionTarget(cfg, profile) : null;
   const partitionId = profile === "guest" ? "guest" : (profileTarget?.partitionId ?? "");
   const session = currentBrowserSession(botId, profile);
+  // The user can point every bot's browser at their own installed Chrome
+  // (Settings → Browser). The path is passed per launch; the bot still runs
+  // in its own agent-browser profile, never the user's signed-in one.
+  const chrome = botChromeExecutablePath(cfg);
+  const chromeEnv: Record<string, string> = chrome.source === "configured" ? { AGENT_BROWSER_EXECUTABLE_PATH: chrome.path! } : {};
   const spec = agentBrowserIntegration({
       binaryPath: status.binaryPath,
       session,
       encryptionKey: browserEngineEncryptionKey(),
       persistent: profile !== "guest",
-      env: { ...process.env, PATH: augmentedPath() },
+      env: { ...process.env, PATH: augmentedPath(), ...chromeEnv },
     });
   await prepareBrowserSessionState(status.binaryPath, session, { env: spec.env, persistent: profile !== "guest", isCurrent: () => {
     const current = store.bot(botId);
@@ -1048,7 +1161,7 @@ async function browserIntegration(botId: string, profile: string | undefined, tu
     kind: "browser", depth: 0, skillAuthoring: false, createdBots: 0, openedThreads: 0 });
   return { profile: partitionId, session, spec, integration: {
     command: process.execPath, args: [SPAWNED_PROXIES.browser], env: {
-      ...AGENTS_NODE_FLAG, OMB_BROWSER_TOKEN: token, OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
+      ...AGENTS_NODE_FLAG, ASTRA_BROWSER_TOKEN: token, ASTRA_HARNESS_URL: `http://127.0.0.1:${PORT}`,
     },
   } };
 }
@@ -1066,8 +1179,8 @@ export function browserEngineSummary(): { kind: "engine" | "unavailable"; reason
 
 function phoneIntegration() {
   const env: Record<string, string> = { ...AGENTS_NODE_FLAG };
-  if (process.env.OMB_ADB_PATH) env.OMB_ADB_PATH = process.env.OMB_ADB_PATH;
-  if (process.env.OMB_RESOURCES_PATH) env.OMB_RESOURCES_PATH = process.env.OMB_RESOURCES_PATH;
+  if (process.env.ASTRA_ADB_PATH) env.ASTRA_ADB_PATH = process.env.ASTRA_ADB_PATH;
+  if (process.env.ASTRA_RESOURCES_PATH) env.ASTRA_RESOURCES_PATH = process.env.ASTRA_RESOURCES_PATH;
   if (process.env.PH_ANDROID_SERIAL) env.PH_ANDROID_SERIAL = process.env.PH_ANDROID_SERIAL;
   return { command: process.execPath, args: [phoneProxyPath], env };
 }
@@ -1103,7 +1216,7 @@ const computerControl = new ComputerControl((botId, snapshot) => {
   // server record, while only the trusted Browser panel may clear Electron's
   // local gate after its server-first release succeeds.
   if (snapshot.held && /^[A-Za-z0-9_-]{1,120}$/.test(botId)) {
-    postDesktopPrivateMessage({ type: "openmausbot:browser-control", botId, held: true });
+    postDesktopPrivateMessage({ type: "astra:browser-control", botId, held: true });
   }
   broadcast({ kind: "computer-control", botId, held: snapshot.held, helpReason: snapshot.helpReason });
 });
@@ -1421,7 +1534,7 @@ function previewSystemPrompt(bot: BotRecord) {
   // `cfg` is the module-level config (`const cfg = loadConfig()` near the
   // top of index.ts), the same object the turn code reads.
   const persona = [
-    `You are ${bot.name}, a personal bot in OpenMausBot.`,
+    `You are ${bot.name}, a personal bot in Astra.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
   ]
@@ -1439,7 +1552,7 @@ function previewSystemPrompt(bot: BotRecord) {
           : null;
   const peers = reachablePeers(store.bots, bot);
   const coordination = bot.chiefOfStaff
-    ? chiefOfStaffSystemPrompt(bot.id, store.bots, true, openMausStatusSystemPrompt())
+    ? chiefOfStaffSystemPrompt(bot.id, store.bots, true, astraStatusSystemPrompt())
     : peers.length > 0
       ? peerRosterSystemPrompt(peers)
       : "";
@@ -2588,7 +2701,7 @@ sessions.onSessionRevoked((sessionId) => {
  * correctly through its own Last-Event-ID with no client code at all. */
 const STREAM_ID = randomUUID().slice(0, 8);
 const REPLAY_MAX = 500;
-const configuredSseHeartbeatMs = Number(process.env.OMB_SSE_HEARTBEAT_MS);
+const configuredSseHeartbeatMs = Number(process.env.ASTRA_SSE_HEARTBEAT_MS);
 const SSE_HEARTBEAT_MS =
   Number.isFinite(configuredSseHeartbeatMs) && configuredSseHeartbeatMs > 0
     ? configuredSseHeartbeatMs
@@ -2781,16 +2894,16 @@ const repeats = new RepeatDetector({ thresholds: [5, 10, 20], maxKeysPerThread: 
 // left its bot busy forever. The watchdog stops a turn whose thread has emitted NOTHING for stallMs —
 // activity-based, so an hour-long turn that keeps streaming is never
 // touched, and turns parked on a human approval are exempt.
-const TURN_STALL_MS = Math.max(60_000, Number(process.env.OMB_TURN_STALL_MS) || 20 * 60_000);
+const TURN_STALL_MS = Math.max(60_000, Number(process.env.ASTRA_TURN_STALL_MS) || 20 * 60_000);
 /** How long ask_bot waits synchronously before the ask is converted into a
  * delegation claim ticket (the peer's turn keeps running either way). */
-const ASK_BOT_TIMEOUT_MS = Math.max(5_000, Number(process.env.OMB_ASK_BOT_TIMEOUT_MS) || 4 * 60_000);
+const ASK_BOT_TIMEOUT_MS = Math.max(5_000, Number(process.env.ASTRA_ASK_BOT_TIMEOUT_MS) || 4 * 60_000);
 // A room waits for a busy teammate instead of dropping them, but never
 // forever: a bot parked on a permission card in another chat is "busy" until
 // a human returns. Past this cap a goal's lead is told the teammate could not
 // free up and reassigns, and a chat round moves on with a chip that says so —
 // the wait ends as data, not as a dead room. Tests shrink it.
-const GROUP_GOAL_WAIT_MAX_MS = Math.max(1_000, Number(process.env.OMB_GOAL_WAIT_MAX_MS) || 30 * 60_000);
+const GROUP_GOAL_WAIT_MAX_MS = Math.max(1_000, Number(process.env.ASTRA_GOAL_WAIT_MAX_MS) || 30 * 60_000);
 // Reassigning around a busy teammate is bounded too: after this many
 // exhausted waits in one run the team is blocked on availability, not stuck.
 const GROUP_GOAL_MAX_WAIT_EXHAUSTIONS = 3;
@@ -3377,7 +3490,7 @@ bus.subscribe((event: RuntimeEvent) => {
       const permission = event.requestType === "permission";
       // A permission request here is one the provider left for a person: its
       // own mode already ran (Ask, Edits, Auto's reviewer, Custom's config).
-      // OpenMausBot decides nothing about the action itself. Only Full access
+      // Astra decides nothing about the action itself. Only Full access
       // answers, because that is exactly what the person granted. A QUESTION
       // always reaches the human — even Full access never invents an answer.
       const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
@@ -4646,7 +4759,11 @@ async function startTurn(
     rewound,
     fresh,
     externallyUpdated: Boolean(externalContextMarker),
-    replaysNatively: instance.driverKind === "grok",
+    // grok and vision are transcript-replay drivers: history rides
+    // SendTurnInput.transcript (vision's RLM harness then exposes it to the
+    // model only as sandbox data), so the turn text is never wrapped with a
+    // replay block.
+    replaysNatively: instance.driverKind === "grok" || instance.driverKind === "vision",
   });
   // Snapshot the cursor alongside the context decision. An external result
   // can arrive during async computer/setup work and clear the task cursor;
@@ -4659,7 +4776,7 @@ async function startTurn(
   const recoveryText = resumeCursor !== undefined ? buildRecoveryText({ text: turnText, transcript }) : undefined;
 
   const persona = [
-    `You are ${bot.name}, a personal bot in OpenMausBot.`,
+    `You are ${bot.name}, a personal bot in Astra.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
   ]
@@ -4755,7 +4872,7 @@ async function startTurn(
         throw Object.assign(new Error("another thread is working in this project folder — wait for it to finish or choose a separate folder"), { status: 409, code: "workspace_busy" });
       }
       // Checkpoint explicit project folders, where a bot can overwrite the
-      // user's work. Its private OpenMaus workspace is app-owned and changes
+      // user's work. Its private Astra workspace is app-owned and changes
       // on nearly every ordinary chat; snapshotting it would add hidden disk
       // and process overhead without a user project to restore.
       const checkpointCwd = cwd && cwd !== privateWorkspace ? cwd : undefined;
@@ -4794,8 +4911,11 @@ async function startTurn(
       // Explicit destinations are strict. In particular, Local VM must never
       // fall through to host CUA and accidentally click on the user's Mac.
       if (wants === "vm") {
-        if (!mountsComputerMcp || instance.driverKind === "boxAgent") {
-          throw new Error("this model engine cannot use the Local VM — choose Claude or an ACP engine, or select another computer destination");
+        // computerMcp is advertised by CLI drivers that mount the MCP server
+        // themselves AND by API drivers with the harness tool loop (the
+        // toolbox below executes the same container MCP server for them).
+        if ((!mountsComputerMcp && instance.adapter.capabilities.apiToolLoop !== true) || instance.driverKind === "boxAgent") {
+          throw new Error("this model engine cannot use the Local VM — choose Claude, an ACP engine, or an API engine with the tool loop, or select another computer destination");
         }
         const localVmTarget = localVmTargetForBot(bot.id);
         bindTurnComputer(resourceOwner, `computer:vm:${localVmTarget.key}`, true);
@@ -4839,15 +4959,17 @@ async function startTurn(
           return containerComputerFrame(undefined, undefined, localVmTarget);
         };
       } else if (wants === "local") {
+        const apiToolLoopLocal = instance.adapter.capabilities.apiToolLoop === true &&
+          instance.adapter.capabilities.localComputerMcp === true;
         if (!shouldMountLocalComputer({
           requested: "local",
           hostPlatform: process.platform,
           providerSupportsLocal: mountsLocalComputer,
-        })) {
-          throw new Error("this model engine cannot control this computer — choose Claude or an ACP engine, or select another destination");
+        }) && !apiToolLoopLocal) {
+          throw new Error("this model engine cannot control this computer — choose Claude, an ACP engine, or an API engine with the tool loop, or select another destination");
         }
         const cua = readCuaConnection();
-        if (!cua) throw new Error("CUA Driver is not ready for this computer — check permissions and restart OpenMausBot");
+        if (!cua) throw new Error("CUA Driver is not ready for this computer — check permissions and restart Astra");
         bindTurnComputer(resourceOwner, "computer:host");
         integrations.localComputer = gatedLocalComputer(cua, controlIntegration(bot.id, threadId, dispatchClaimId));
         computerKind = "local";
@@ -4874,7 +4996,7 @@ async function startTurn(
             const vpsControl = controlIntegration(bot.id, threadId, dispatchClaimId);
             integrations.localComputer = {
               ...vpsMcp,
-              env: { ...vpsMcp.env, OMB_CONTROL_URL: vpsControl.url, OMB_CONTROL_TOKEN: vpsControl.token },
+              env: { ...vpsMcp.env, ASTRA_CONTROL_URL: vpsControl.url, ASTRA_CONTROL_TOKEN: vpsControl.token },
             };
             computerKind = "vps";
             previewCapture = () => vps.vpsComputerScreenshot(targetCfg, bot.id);
@@ -5006,7 +5128,7 @@ async function startTurn(
             bot.id,
             store.bots,
             Boolean(integrations.agents),
-            openMausStatusSystemPrompt(),
+            astraStatusSystemPrompt(),
           )
         : integrations.agents && sectionPeers.length > 0
           // Ordinary bots could always CALL the peer tools; until now the
@@ -5067,6 +5189,24 @@ async function startTurn(
           browserCapture = () => browserRuntime.withAgentAction(session, () => agentBrowserFrame(frame));
         }
       }
+      // API-driven engines have no agent process to mount MCP servers — the
+      // harness is the host instead. When this turn mounted tool surfaces
+      // (computer/browser/phone/custom), spawn their MCP servers now and hand
+      // the shared runtime a ready-to-call toolbox; the runtime closes it when
+      // the turn settles. CLI engines keep their native mounting and receive
+      // `tools` never — their capabilities don't claim apiToolLoop.
+      // Built AFTER the browser mount above: buildApiToolbox snapshots
+      // `integrations`, so a browser mounted after the build would silently
+      // contribute no tools to this turn.
+      let turnToolbox: Awaited<ReturnType<typeof buildApiToolbox>> | null = null;
+      if (instance.adapter.capabilities.apiToolLoop === true) {
+        turnToolbox = await buildApiToolbox(integrations as Parameters<typeof buildApiToolbox>[0]);
+        if (turnToolbox.toolListProblems.length > 0) {
+          for (const problem of turnToolbox.toolListProblems) {
+            console.warn(`api-tools: ${problem}`);
+          }
+        }
+      }
       // A cancelled adapter can be between accepting sendTurn and revealing
       // its provider turn id. Never overlap a replacement with that ambiguous
       // pre-id window: wait for the old handshake to settle or for its bounded
@@ -5113,30 +5253,48 @@ async function startTurn(
         { id: "webhook", label: "Webhook provenance", text: opts?.automationSource === "webhook" ? WEBHOOK_PROMPT : "" },
         { id: "mentions", label: "Mentions", text: mentionPrompt(tagged) },
       ]);
-      const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
-        threadId,
-        text: turnText,
-        images: turnImages,
-        approvalMode: approvalModeForTurn(bot, commsDepth > 0),
-        model,
-        effort,
-        // a rewound thread never resumes the abandoned branch's session
-        // the active task's own session — another task's cursor would
-        // resume the wrong conversation and defeat the context bubble
-        resumeCursor,
-        ...(recoveryText !== undefined ? { recoveryText } : {}),
-        transcript,
-        system: prompt.text,
-        systemStable: prompt.stable,
-        systemVolatile: prompt.volatile,
-        integrations,
-        cwd,
-      }), () => !directTurnClaimExists(bot.id, dispatchClaimId, threadId), async () => {
-        await instance.adapter.interruptTurn(threadId).catch(() => {});
-      });
+      let dispatch: { value: TurnStartResult; cancelled: boolean };
+      try {
+        dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
+          threadId,
+          text: turnText,
+          images: turnImages,
+          ...(turnToolbox && turnToolbox.tools.length > 0 ? { tools: { list: turnToolbox.tools, close: turnToolbox.close } } : {}),
+          approvalMode: approvalModeForTurn(bot, commsDepth > 0),
+          model,
+          effort,
+          // a rewound thread never resumes the abandoned branch's session
+          // the active task's own session — another task's cursor would
+          // resume the wrong conversation and defeat the context bubble
+          resumeCursor,
+          ...(recoveryText !== undefined ? { recoveryText } : {}),
+          transcript,
+          system: prompt.text,
+          systemStable: prompt.stable,
+          systemVolatile: prompt.volatile,
+          integrations,
+          cwd,
+        }), () => !directTurnClaimExists(bot.id, dispatchClaimId, threadId), async () => {
+          await instance.adapter.interruptTurn(threadId).catch(() => {});
+        });
+      } catch (error) {
+        // sendTurn refused synchronously (already-running turn, missing key):
+        // the toolbox was never accepted, so its spawned servers are ours to
+        // close before the error propagates.
+        if (turnToolbox) await turnToolbox.close().catch(() => {});
+        throw error;
+      }
       if (dispatch.cancelled) {
         retireProviderTurn(dispatch.value.turnId);
         throw new DirectTurnSetupCancelled("turn stopped during provider setup");
+      }
+      // Ownership moved: sendTurn accepted the toolbox (the runtime's finally
+      // closes it), unless it was dropped because the turn mounted no tools —
+      // then close it here instead of leaking the spawned servers.
+      if (turnToolbox && turnToolbox.tools.length > 0) turnToolbox = null;
+      else if (turnToolbox) {
+        await turnToolbox.close().catch(() => {});
+        turnToolbox = null;
       }
       bindInternalCapabilityToProviderTurn(threadId, dispatchClaimId, dispatch.value.turnId);
       if (directFollowupSettlers.has(dispatchClaimId) && dispatch.value.turnId &&
@@ -5554,10 +5712,10 @@ store.reconcileInterruptedGroupGoals((runId, threadId) => {
   );
   const detail = run.output ?? run.error ?? (
     status === "completed"
-      ? "The scheduled team goal completed before OpenMausBot restarted."
+      ? "The scheduled team goal completed before Astra restarted."
       : status === "stopped"
         ? "The scheduled team goal was stopped."
-        : "OpenMausBot restarted before this scheduled team goal finished."
+        : "Astra restarted before this scheduled team goal finished."
   );
   return { status, detail, finishedAt: run.finishedAt ?? groupGoalRecoveryAt };
 });
@@ -5595,7 +5753,7 @@ async function cloudRoutineReadiness(): Promise<{ ready: boolean; reason?: strin
   }
   const instance = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
   if (!instance) {
-    return { ready: false, reason: "The Cloud VM runner is unavailable. Restart OpenMausBot and try again." };
+    return { ready: false, reason: "The Cloud VM runner is unavailable. Restart Astra and try again." };
   }
   try {
     const snapshot = await instance.snapshot();
@@ -5811,10 +5969,10 @@ try {
     claimRequest: () => workspaceMaintenance.request(),
   });
   const advertised = WEBHOOK_PUBLIC_URL ? ` (advertised as ${webhookIngress.baseUrl})` : "";
-  console.log(`openmausbot webhook receiver on http://${webhookIngress.host}:${webhookIngress.port}${advertised}`);
+  console.log(`astra webhook receiver on http://${webhookIngress.host}:${webhookIngress.port}${advertised}`);
 } catch (error) {
   webhookIngressError = error instanceof Error ? error.message : String(error);
-  console.error(`openmausbot webhook receiver unavailable: ${webhookIngressError}`);
+  console.error(`astra webhook receiver unavailable: ${webhookIngressError}`);
 }
 
 const webhookIngressStatus = () => ({
@@ -6257,7 +6415,7 @@ async function runGroupMemberTurn(
     ? reachablePeers(store.bots, bot).filter((peer) => !readyGroup.memberIds.includes(peer.id))
     : [];
   const system = [
-    `You are ${bot.name}, a bot in the room "${readyGroup.name}" in OpenMausBot.`,
+    `You are ${bot.name}, a bot in the room "${readyGroup.name}" in Astra.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
     `Room members: ${roster}, and ${userName} (the human).`,
@@ -7651,7 +7809,7 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
   const owner = connectorThread(entry.botId, entry.threadId);
   if (!owner) return;
   const names = entry.labels.join(", ");
-  const prompt = `OpenMausBot connection update: the user securely connected ${names}. Continue the task that paused for this connection. Do not ask them to connect it again.`;
+  const prompt = `Astra connection update: the user securely connected ${names}. Continue the task that paused for this connection. Do not ask them to connect it again.`;
   if (owner.group ? owner.bot.busy : threadBusy(entry.botId, entry.threadId) || activeGroupTurnForBot(entry.botId)) {
     pendingConnectorResumes.set(`${entry.threadId}:${entry.resumeKey}`, entry);
     return;
@@ -7758,7 +7916,7 @@ function phoneSecretSubmissionKey(threadId: string, messageId: string, requestKe
 }
 
 function credentialDesktopHandoff(label: string): string {
-  return `Securely provide the ${label} from OpenMausBot on your phone or computer. It is never added to chat.`;
+  return `Securely provide the ${label} from Astra on your phone or computer. It is never added to chat.`;
 }
 
 function secretMessage(botId: string, threadId: string, messageId: string): Message | null {
@@ -7795,8 +7953,8 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
   if (!owner) return;
   const prompt =
     entry.outcome === "provided"
-      ? `OpenMausBot credential update: the user securely provided ${entry.label}. Continue the task that paused for it. You do not receive the secret and must not ask them to paste it into chat.`
-      : `OpenMausBot credential update: the user declined to provide ${entry.label}. Continue without it if possible, or briefly explain the limitation. Do not ask them to paste it into chat.`;
+      ? `Astra credential update: the user securely provided ${entry.label}. Continue the task that paused for it. You do not receive the secret and must not ask them to paste it into chat.`
+      : `Astra credential update: the user declined to provide ${entry.label}. Continue without it if possible, or briefly explain the limitation. Do not ask them to paste it into chat.`;
   if (owner.group ? owner.bot.busy : threadBusy(entry.botId, entry.threadId) || activeGroupTurnForBot(entry.botId)) {
     pendingSecretResumes.set(`${entry.threadId}:${entry.messageId}`, entry);
     return;
@@ -8039,10 +8197,10 @@ function cliProbeEnvironment(): NodeJS.ProcessEnv {
     "BOX_TOKEN",
     "OPENCODE_API_KEY",
     "COMPOSIO_API_KEY",
-    "OMB_COMPOSIO_BROKER_TOKEN",
-    "OMB_TTS_KEY",
-    "OMB_OPENAI_IMAGE_KEY",
-    "OMB_CUSTOM_IMAGE_KEY",
+    "ASTRA_COMPOSIO_BROKER_TOKEN",
+    "ASTRA_TTS_KEY",
+    "ASTRA_OPENAI_IMAGE_KEY",
+    "ASTRA_CUSTOM_IMAGE_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
   ]) {
@@ -8160,6 +8318,7 @@ function configStatus() {
     billing: { currency: cfg.billing?.currency ?? "USD", prices: cfg.billing?.prices ?? {} },
     // the base URL is a setting, not a secret; the key stays write-only
     openaiCompat: { configured: Boolean(cfg.openaiCompat?.key), url: cfg.openaiCompat?.url ?? "" },
+    vision: { configured: Boolean(cfg.vision?.key), url: cfg.vision?.url ?? "" },
     composio: {
       configured: composio.configured(cfg),
       mode: composio.connectionMode(cfg),
@@ -8169,6 +8328,7 @@ function configStatus() {
     opencodeGo: { configured: Boolean(cfg.opencodeGo?.apiKey) },
     // the chosen voice is a setting, not a secret; the key is reported the
     // same configured-or-not way as every other credential
+    wakeWord: { configured: Boolean(cfg.wakeWord?.accessKey) },
     tts: tts.describeVoice(cfg),
     imageGen: avatarImageStatus(cfg),
     // not a secret — the sidebar shows it
@@ -8185,6 +8345,7 @@ function configStatus() {
       skillAuthoring: skillAuthoringEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
       browser: builtInBrowserEnabled(cfg),
+      selfModify: selfModifyEnabled(cfg),
     },
     // first-run progress — not a secret; the app decides whether to show
     // the welcome tour from this, never from browser storage
@@ -8197,6 +8358,9 @@ function configStatus() {
     // Which browser this server can give bots: the desktop app's surface,
     // the agent-browser engine, or nothing yet (with the reason).
     browserEngine: browserEngineSummary(),
+    // the configured Chrome path is a setting, not a secret — Settings
+    // shows it so it can be edited or cleared
+    browser: { chromePath: cfg.browser?.chromePath ?? "" },
     // partitionId is non-secret routing metadata. The renderer needs it to
     // show the same durable session as an agent, but config PATCH validation
     // keeps it read-only and rejects callers that try to choose it.
@@ -8345,7 +8509,7 @@ let mcpProbesInFlight = 0;
 const claudeUpdatesInFlight = new Set<string>();
 
 // ── HTTP plumbing ─────────────────────────────────────────────────────
-/** The built UI, when this process serves it (OMB_STATIC_DIR: set by the
+/** The built UI, when this process serves it (ASTRA_STATIC_DIR: set by the
  * desktop app and by the container image). Public by design: it is the same
  * bundle anyone can download, holds no secrets, and a remote browser must be
  * able to load /pair before it has a session. Returns false when there is
@@ -8493,10 +8657,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // code into a session. Everything else needs the loopback owner or a
     // paired session with the right scope.
     if (method === "GET" && !path.startsWith("/api/") && !path.startsWith("/.well-known/") && serveStatic(res, path)) return;
-    if (method === "GET" && path === "/.well-known/openmausbot/environment") {
+    if (method === "GET" && path === "/.well-known/astra/environment") {
       return json(res, 200, environmentDescriptor({ environmentId: ENVIRONMENT_ID, desktopManaged: DESKTOP_MANAGED, emailSignIn: emailSignIn.enabled() }));
     }
-    const domainCheck = /^\/\.well-known\/openmausbot\/domain-check\/([a-f0-9]{64})$/.exec(path);
+    const domainCheck = /^\/\.well-known\/astra\/domain-check\/([a-f0-9]{64})$/.exec(path);
     if (method === "GET" && domainCheck) {
       res.setHeader("cache-control", "no-store");
       const challenge = customDomainVerifier.challenge(domainCheck[1]);
@@ -8589,7 +8753,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // A stranger learns only the app name; pid (the desktop boot probe keys
     // on it) and the static flag stay behind the gate below.
     if (method === "GET" && path === "/api/health" && !gate.auth) {
-      return json(res, 200, { app: "openmausbot" });
+      return json(res, 200, { app: "astra" });
     }
     // The brand is public too: the sign-in page must carry the deployment's
     // name and icon before anyone has a session, and it holds nothing secret.
@@ -8650,7 +8814,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         url: base ? `${base}/pair#code=${code}` : null,
         hint: base
           ? null
-          : "this server has no public address to put in a link: set OMB_PUBLIC_URL, or open /pair on the address you use and type the code",
+          : "this server has no public address to put in a link: set ASTRA_PUBLIC_URL, or open /pair on the address you use and type the code",
       });
     }
     if (method === "GET" && path === "/api/auth/pairing") return json(res, 200, { pairings: sessions.openPairings(), publicUrl: publicUrl() });
@@ -8661,7 +8825,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       res.setHeader("cache-control", "no-store");
       if (method === "GET") return json(res, 200, customDomainStatus());
       if (method === "POST" || method === "DELETE") {
-        if (DESKTOP_MANAGED) return json(res, 409, { error: "Custom domains are configured on a self-hosted OpenMausBot server, not the desktop companion." });
+        if (DESKTOP_MANAGED) return json(res, 409, { error: "Custom domains are configured on a self-hosted Astra server, not the desktop companion." });
         if (!/^application\/json\b/i.test(String(req.headers["content-type"] ?? ""))) {
           return json(res, 415, { error: "content-type must be application/json" });
         }
@@ -8705,10 +8869,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // unless the launcher explicitly sets that key; production builds never
     // set it.
     if (method === "POST" && path === "/api/testing/internal-capability") {
-      const expected = process.env.OMB_TEST_INTERNAL_CAPABILITY_KEY ?? "";
-      const actual = Array.isArray(req.headers["x-openmausbot-test-capability"])
+      const expected = process.env.ASTRA_TEST_INTERNAL_CAPABILITY_KEY ?? "";
+      const actual = Array.isArray(req.headers["x-astra-test-capability"])
         ? ""
-        : String(req.headers["x-openmausbot-test-capability"] ?? "");
+        : String(req.headers["x-astra-test-capability"] ?? "");
       const expectedBytes = Buffer.from(expected);
       const actualBytes = Buffer.from(actual);
       if (
@@ -9229,6 +9393,67 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           warnings: staged.warnings,
           summary: card.summary,
         });
+      }
+      // ── self-modify: the bot's own edit pipeline (feature-gated) ────
+      // The agent-facing door, used by the agents-proxy `self_modify` tool.
+      // The gate is the operator's opt-in, read per request, so turning it
+      // off revokes the tool without a restart. Every path here runs the
+      // same journal-first / preflight / trial-boot pipeline the operator
+      // API uses — this door adds no authority of its own, and the protected
+      // paths and content patterns refuse agent edits exactly as they
+      // refuse anyone else's.
+      if (path === "/api/internal/self-modify" || path.startsWith("/api/internal/self-modify/")) {
+        if (!selfModifyEnabled(cfg)) return json(res, 403, { error: "self-modify is not enabled in Settings" });
+        const from = internalSender;
+        const fromThreadId = internalCapability.threadId;
+        if (!connectorThread(from.id, fromThreadId)) {
+          return json(res, 403, { error: "source conversation does not belong to sender" });
+        }
+        if (method === "GET" && path === "/api/internal/self-modify") {
+          return json(res, 200, {
+            enabled: true,
+            journal: listJournal().map((entry) => ({
+              id: entry.proposal.id,
+              proposedBy: entry.proposal.proposedBy,
+              reason: entry.proposal.reason,
+              status: entry.status,
+              appliedAt: entry.appliedAt,
+              verifiedAt: entry.verifiedAt ?? null,
+              revertedAt: entry.revertedAt ?? null,
+              revertReason: entry.revertReason ?? null,
+              files: entry.proposal.files.map((file) => `${file.action} ${file.path}`),
+              checks: entry.checks ?? [],
+            })),
+            pending: listPending(),
+          });
+        }
+        if (method === "POST" && path === "/api/internal/self-modify") {
+          const body = await readInternalBody();
+          const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+          if (!reason) return json(res, 400, { error: "reason is required — say why this change is being proposed" });
+          const files = Array.isArray(body.files) ? body.files : [];
+          if (!files.length) {
+            return json(res, 400, { error: "files must be a non-empty array of { path, action, content }" });
+          }
+          const requestedId = typeof body.id === "string" ? body.id.trim() : "";
+          const id = requestedId || `edit-${Date.now().toString(36)}-${randomBytes(2).toString("hex")}`;
+          const result = submitProposal(JSON.stringify({ id, proposedBy: from.name, reason, files }));
+          if (!result.ok) return json(res, 422, result);
+          return json(res, 201, result);
+        }
+        const mInternalSelf = path.match(/^\/api\/internal\/self-modify\/([a-zA-Z0-9._-]{1,64})$/);
+        if (mInternalSelf && method === "POST") {
+          const body = await readInternalBody();
+          const action = body.action === "apply" || body.action === "discard" ? body.action : "";
+          if (!action) return json(res, 400, { error: "action must be apply or discard" });
+          const id = mInternalSelf[1]!;
+          if (action === "discard") {
+            const removed = discardPending(id);
+            return json(res, removed ? 200 : 404, removed ? { ok: true, discarded: id } : { error: "no pending proposal with that id" });
+          }
+          const result = applyPending(id);
+          return json(res, result.ok ? 200 : 422, result);
+        }
       }
       if (method === "POST" && path === "/api/internal/ask-bot") {
         const body = await readInternalBody();
@@ -10183,7 +10408,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // ── independent webhook triggers ────────────────────────────────────
     // Management stays on the app-only server. Actual deliveries land on a
     // second, webhook-only loopback listener so Funnel or a future hosted
-    // relay never has to expose the rest of OpenMausBot's control surface.
+    // relay never has to expose the rest of Astra's control surface.
     if (path === "/api/webhooks" && method === "GET") {
       return json(res, 200, { webhooks: webhooks.list(), attempts: webhooks.listAttempts(), ingress: webhookIngressStatus() });
     }
@@ -10339,7 +10564,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // it never grants authority or replaces the existing request gate.
     const requirePinnedClientThread = (botId: string, threadId: unknown): void => {
       if (threadId === undefined &&
-        (auth.kind === "session" || req.headers["x-openmausbot-companion"] === "1") &&
+        (auth.kind === "session" || req.headers["x-astra-companion"] === "1") &&
         store.tasks(botId).length > 1) {
         throw Object.assign(new Error("This bot has multiple threads. Update this client and choose a thread before sending this action."), { status: 409 });
       }
@@ -10412,7 +10637,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // a bot must render a Markdown link to it, while a user message must carry
     // the exact standalone attachment tag written by the composer. The bot
     // branch derives conversation/workspace roots; the user branch is limited
-    // to OpenMausBot's private attachment directory. This is deliberately not
+    // to Astra's private attachment directory. This is deliberately not
     // a general path reader.
     m = path.match(/^\/api\/threads\/([\w-]+)\/messages\/([\w-]+)\/file$/);
     const streamsMessageImage = Boolean(
@@ -10739,7 +10964,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ? body.name.trim()
           : profileName
             ? `${profileName}'s Team`
-            : "My OpenMaus Team";
+            : "My Astra Team";
       const memberIds = store.bots.filter((bot) => !bot.hidden).map((bot) => bot.id);
       if ((body.format === "backup" ? store.bots.length : memberIds.length) === 0) return json(res, 400, { error: "Create a bot before exporting your team" });
       try {
@@ -12142,7 +12367,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           });
         }
         // LIST is eventually consistent, and a remembered Box may also have
-        // been renamed outside OpenMausBot. The create journal is stronger
+        // been renamed outside Astra. The create journal is stronger
         // ownership evidence: inspect every durable id directly before the bot
         // record that makes it discoverable can be removed. Missing credentials
         // or an unavailable provider must fail closed.
@@ -12283,7 +12508,44 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, { ok: true });
     }
 
-    // ── section context: a user-owned team brief ────────────────────────
+    // ── prompt library: read-only catalog, built-ins + GitHub import ────
+    // Read-only on purpose: applying a preset goes through the normal bot
+    // patch (soul cap, history, drift all keep single ownership), so this
+    // endpoint only ever lists. Import mirrors skill imports' GitHub-only,
+    // bounded-fetch policy. See server/prompt-presets.ts.
+    m = path.match(/^\/api\/prompt-library(\/.*)?$/);
+    if (m && method === "GET") {
+      if (m[1]) {
+        const source = decodeURIComponent(m[1].slice(1));
+        if (!source) return json(res, 400, { error: "source must not be empty" });
+        // `meta:<source>` distills: fetch the prompts verbatim, then have an
+        // available engine reduce each one to vendor-neutral principles.
+        // Results are cached by source content (server/prompt-distill.ts);
+        // one prompt's failure is one error line, never the batch's.
+        const metaRequested = source.startsWith(META_SOURCE_PREFIX);
+        const fetched = await fetchPromptsFromSource(metaRequested ? source.slice(META_SOURCE_PREFIX.length) : source);
+        if ("error" in fetched) return json(res, 422, { error: fetched.error });
+        if (metaRequested) {
+          const complete = async (prompt: string): Promise<string> => {
+            for (const candidate of registry.instances()) {
+              if (typeof candidate.generateText !== "function") continue;
+              try {
+                const snapshot = await candidate.snapshot();
+                if (snapshot.state !== "available") continue;
+                return await candidate.generateText(prompt);
+              } catch {
+                continue; // a dead engine is the next engine's turn
+              }
+            }
+            throw new Error("no available engine to distill with — connect an engine first, or import without the meta: prefix");
+          };
+          const distilled = await distillPrompts(fetched.presets, complete);
+          return json(res, 200, { presets: distilled.presets.map(presetWire), errors: [...fetched.errors, ...distilled.errors] });
+        }
+        return json(res, 200, { presets: fetched.presets.map(presetWire), errors: fetched.errors });
+      }
+      return json(res, 200, { presets: BUILT_IN_PRESETS.map(presetWire), collections: PROMPT_COLLECTIONS });
+    }
     // Bots receive this in their system context, but no agent tool can write
     // it. That keeps one bot from silently changing every teammate's future
     // turns. The section query parameter is required even for General (""),
@@ -12555,7 +12817,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // to open by hand instead.
       const workspacePath = memoryOverview(m[1]).workspacePath;
       if (auth.kind !== "loopback") {
-        return json(res, 403, { error: `This only works on the computer running OpenMausBot. The memory folder there is ${workspacePath}`, workspacePath });
+        return json(res, 403, { error: `This only works on the computer running Astra. The memory folder there is ${workspacePath}`, workspacePath });
       }
       const opened = await openMemoryLocation(m[1], parsed.data.target);
       if (!opened.ok) return json(res, 500, { error: opened.error, workspacePath: opened.workspacePath });
@@ -13408,7 +13670,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // child proves it is OURS by echoing its pid (a stray dev server has
     // the same API shape but a different pid)
     if (method === "GET" && path === "/api/health") {
-      return json(res, 200, { app: "openmausbot", pid: process.pid, static: Boolean(STATIC_DIR) });
+      return json(res, 200, { app: "astra", pid: process.pid, static: Boolean(STATIC_DIR) });
     }
     // The bots' browser engine: install it on this machine (agent-browser +
     // a Chrome for Testing, a one-time download), or ask how that is going.
@@ -13439,7 +13701,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (fleetRoute) {
       if (!entitled("admin")) return json(res, 403, { error: "Workspaces need an enterprise licence with the admin feature." });
       const socket = fleetSocketPath();
-      if (!fleetAvailable(socket)) return json(res, 404, { error: "No fleet agent on this server. Run `openmausbot fleet init --domain … --operator <this user>` as root." });
+      if (!fleetAvailable(socket)) return json(res, 404, { error: "No fleet agent on this server. Run `astra fleet init --domain … --operator <this user>` as root." });
       const [, resource, slug, sub] = fleetRoute;
       let forward: { method: string; path: string; body?: unknown } | null = null;
       if (method === "GET" && !resource) forward = { method: "GET", path: "/workspaces" };
@@ -13584,6 +13846,18 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const state = await providerAuthSessions.status(authStatus[1], auth.kind === "session" ? auth.session.id : "loopback", url.searchParams.get("flowId") ?? "");
       return json(res, 200, { auth: state });
     }
+    // The app-open refresh: every engine's catalog in one pass, then a single
+    // describe(). Fanning out to the per-instance route instead describes the
+    // whole fleet once per engine, so opening an N-engine app spent N×N engine
+    // probes — N refreshes, each re-snapshotting every sibling.
+    if (method === "POST" && path === "/api/instances/refresh-models") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: "content-type must be application/json" });
+      }
+      await registry.refreshAllModels();
+      return json(res, 200, { instances: await describeInstances() });
+    }
+
     const instanceAction = /^\/api\/instances\/([\w.-]+)\/(refresh-models|install|auth\/start|auth\/complete|auth\/cancel|auth\/sign-out)$/.exec(path);
     if (method === "POST" && instanceAction) {
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
@@ -13599,7 +13873,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 200, { instances: await describeInstances() });
         }
         if (action === "install") {
-          if (!(await registry.installRuntime(instanceId))) return json(res, 404, { error: "Installing this engine from Settings is not available on this server. Use the install command on the machine running OpenMausBot." });
+          if (!(await registry.installRuntime(instanceId))) return json(res, 404, { error: "Installing this engine from Settings is not available on this server. Use the install command on the machine running Astra." });
           return json(res, 200, { instances: await describeInstances() });
         }
         if (action === "auth/start") {
@@ -13915,6 +14189,89 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
 
+    // ── self-modify: journal + pending inbox (admin scope) ──────────
+    // The gate is read per request so toggling the feature takes effect
+    // without a restart. Every mutation requires admin; applying runs the
+    // journal-first + preflight + trial-boot pipeline from self-modify.ts.
+    if (path === "/api/self-modify" || path.startsWith("/api/self-modify/")) {
+      if (!selfModifyEnabled(cfg)) return json(res, 403, { error: "self-modify is disabled — set features.selfModify or ASTRA_SELF_MODIFY=1" });
+      if (!auth.scopes.includes("admin")) return json(res, 403, { error: "admin scope required" });
+
+      if (method === "GET" && path === "/api/self-modify") {
+        return json(res, 200, {
+          journal: listJournal().map((entry) => ({
+            id: entry.proposal.id,
+            proposedBy: entry.proposal.proposedBy,
+            reason: entry.proposal.reason,
+            status: entry.status,
+            appliedAt: entry.appliedAt,
+            verifiedAt: entry.verifiedAt ?? null,
+            revertedAt: entry.revertedAt ?? null,
+            revertReason: entry.revertReason ?? null,
+            files: entry.proposal.files.map((f) => f.path),
+            checks: entry.checks ?? [],
+          })),
+          pending: listPending(),
+          enabled: true,
+        });
+      }
+
+      // The emergency brake, one click wide: every proposal the running code
+      // has not yet proven goes back to its journaled bytes. Verified history
+      // is untouched — this only settles entries still at `applied`.
+      if (method === "POST" && path === "/api/self-modify") {
+        const body = await readBody(req);
+        if (body?.action !== "revert-unverified") {
+          return json(res, 400, { error: 'action must be "revert-unverified"' });
+        }
+        const reverted: string[] = [];
+        for (const entry of listJournal()) {
+          if (entry.status !== "applied") continue;
+          if (settleProposal(entry.proposal.id, "reverted", "reverted together by the operator")) {
+            reverted.push(entry.proposal.id);
+          }
+        }
+        return json(res, 200, { reverted });
+      }
+
+      const mSelf = path.match(/^\/api\/self-modify\/([a-zA-Z0-9._-]{1,64})$/);
+      if (mSelf && method === "GET") {
+        const entry = listJournal().find((candidate) => candidate.proposal.id === mSelf[1]);
+        if (!entry) return json(res, 404, { error: "no journal entry with that id" });
+        return json(res, 200, { entry });
+        }
+
+      if (mSelf && method === "POST") {
+        // action is in the body: apply | revert | verify | discard
+        const body = await readBody(req);
+        const action = typeof body?.action === "string" ? body.action : "";
+        const id = mSelf[1]!;
+        if (action === "apply") {
+          const result = applyPending(id);
+          return json(res, result.ok ? 200 : 422, result);
+        }
+        const entry = listJournal().find((candidate) => candidate.proposal.id === id);
+        if (action === "revert" && entry) {
+          const reverted = revertProposal(entry, "reverted by operator");
+          writeJournal(reverted);
+          return json(res, 200, { entry: reverted });
+        }
+        if (action === "verify" && entry) {
+          if (entry.proposal.files.some((f) => f.path.startsWith("server/") || f.path.startsWith("shared/")) || entry.proposal.packageJson) {
+            return json(res, 409, { error: "server-touching proposals are verified by a trial boot, not by hand" });
+            }
+          const verified = { ...entry, status: "verified" as const, verifiedAt: new Date().toISOString() };
+          writeJournal(verified);
+          return json(res, 200, { entry: verified });
+        }
+        if (action === "discard") {
+          const removed = discardPending(id);
+          return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: "no pending proposal with that id" });
+        }
+        return json(res, 400, { error: "action must be apply | revert | verify | discard" });
+      }
+    }
+
     // ── app config (API keys — never echoed back, booleans only) ──
     if (method === "GET" && path === "/api/config") {
       return json(res, 200, configForAccess(configStatus(), auth.scopes.includes("admin")));
@@ -13931,6 +14288,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       const disablingBuiltInBrowser = patch.features?.browser === false && builtInBrowserEnabled(cfg);
+      // Turning self-modify off must not leave an unverified proposal on
+      // disk: the trial-boot machinery would not run to judge it.
+      const disablingSelfModify = patch.features?.selfModify === false && selfModifyEnabled(cfg);
       const removedBrowserProfileIds = patch.browserProfiles === undefined
         ? []
         : (cfg.browserProfiles ?? [])
@@ -14238,6 +14598,14 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       let browserReferenceCleanupError: unknown = null;
       if (disablingBuiltInBrowser) browserLive.closeAll();
+      if (disablingSelfModify) {
+        for (const entry of listJournal()) {
+          if (entry.status !== "applied") continue;
+          const reverted = revertProposal(entry, "self-modify disabled while the proposal was unverified");
+          writeJournal(reverted);
+          console.log(`self-modify: reverted "${entry.proposal.id}" — feature disabled`);
+        }
+      }
       for (const request of browserCleanupRequests) {
         if (request.kind === "profile") browserLive.closeForSession(browserSessionId("", request.partitionId));
       }
@@ -14324,12 +14692,14 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Splitting text into utterances lives HERE, not in the renderer, for
     // the same reason approvalKey does — it is the piece most likely to be
     // tuned against real transcripts, and it belongs next to the transform
-    // that produced it.
+    // that produced it. So does the choice of which half of a reply is
+    // spoken at all: the lead, per the section convention. A caller asks for
+    // the message to be read; what is worth hearing is not its concern.
     if (method === "POST" && path === "/api/tts/prepare") {
       const body = await readBody(req);
       return json(res, 200, {
         ready: tts.voiceReady(cfg, typeof body.voiceId === "string" ? body.voiceId : undefined),
-        utterances: toUtterances(String(body.text ?? "")),
+        utterances: toUtterances(spokenReply(String(body.text ?? ""))),
       });
     }
     if (method === "GET" && path === "/api/tts/voices") {
@@ -14338,6 +14708,28 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       } catch (e) {
         return json(res, 200, { voices: [], error: e instanceof Error ? e.message : String(e) });
       }
+    }
+    // Piper is the one voice engine that is not on the machine by default:
+    // the user asks for it here, and the download is hash-pinned and reported
+    // through the config frame's tts block. Nothing fetches on its own, and a
+    // second request while one is running joins the first.
+    if (method === "POST" && path === "/api/tts/piper/install") {
+      const target = piperInstall.piperTarget();
+      if (!piperInstall.piperInstallable(target)) {
+        return json(res, 409, {
+          error: `Piper publishes no engine for ${target} — install it manually (see the voice docs).`,
+        });
+      }
+      const { started, done } = piperInstall.startPiperInstall({ log: (line) => console.log(line) });
+      // The download takes minutes, not milliseconds: answer now, and let the
+      // config frame carry the progress and then the outcome (the same shape
+      // the browser engine's install uses). The first broadcast is what tells
+      // the panel it is installing rather than merely pending.
+      if (started) {
+        broadcast({ kind: "config", ...configStatus() });
+        void done.then(() => broadcast({ kind: "config", ...configStatus() }));
+      }
+      return json(res, 202, { installing: true });
     }
     if (method === "POST" && path === "/api/tts/speak") {
       const body = await readBody(req);
@@ -14411,10 +14803,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Electron server has the private key needed to open the envelope.
     m = path.match(/^\/api\/bots\/([\w-]+)\/secret-cards\/([\w-]+)\/provide$/);
     if (m && method === "POST") {
-      if (req.headers["x-openmausbot-companion"] !== "1") {
+      if (req.headers["x-astra-companion"] !== "1") {
         return json(res, 403, { error: "Secure phone entry must come from a paired phone" });
       }
-      const rawDeviceId = req.headers["x-openmausbot-companion-device"];
+      const rawDeviceId = req.headers["x-astra-companion-device"];
       const authenticatedDeviceId = Array.isArray(rawDeviceId) ? "" : String(rawDeviceId ?? "");
       if (!/^[\w-]{1,128}$/.test(authenticatedDeviceId)) {
         return json(res, 401, { error: "This paired phone could not be verified" });
@@ -14771,7 +15163,20 @@ restoreSteeredMessages();
 restoreChannelMessages();
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+  console.log(`astra server on http://127.0.0.1:${PORT}`);
+  // The trial boot survived parse, module init, and listener bind: the
+  // riskiest window is behind us, so the live proposal is promoted and the
+  // boot-crash guard comes off.
+  try {
+    const verified = verifyBootedProposal();
+    if (verified) console.log(`self-modify: trial boot verified "${verified.proposal.id}"`);
+  } catch (error) {
+    console.warn(`self-modify: verify failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (selfModifyBootGuard) {
+    process.off("uncaughtException", selfModifyBootGuard);
+    selfModifyBootGuard = null;
+  }
   followupsReady = true;
   drainQueuedSends();
   drainQueuedChannelSends();
@@ -14792,18 +15197,18 @@ server.listen(PORT, "127.0.0.1", () => {
   }
 });
 
-// A second listener for `openmausbot serve --tunnel` (server/tunnel.ts): the
+// A second listener for `astra serve --tunnel` (server/tunnel.ts): the
 // connector gateway on this machine forwards public traffic to this IPC path.
 // Nothing changes about the loopback bind above. Requests arriving here have
 // no peer address, which request-auth treats as "through a proxy": a session
 // is required, never loopback trust, whatever headers the request carries.
-const TUNNEL_SOCKET = process.env.OMB_TUNNEL_SOCKET?.trim() || null;
+const TUNNEL_SOCKET = process.env.ASTRA_TUNNEL_SOCKET?.trim() || null;
 let tunnelListener: ReturnType<typeof createServer> | null = null;
 if (TUNNEL_SOCKET) {
   if (process.platform !== "win32") rmSync(TUNNEL_SOCKET, { force: true });
   tunnelListener = createServer(handleRequest);
   tunnelListener.listen(TUNNEL_SOCKET, () => {
-    console.log(`openmausbot tunnel listener on ${TUNNEL_SOCKET}`);
+    console.log(`astra tunnel listener on ${TUNNEL_SOCKET}`);
   });
 }
 

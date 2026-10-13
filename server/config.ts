@@ -1,9 +1,9 @@
-// Config + data dirs. One file, ~/.openmausbot/config.json, env fallbacks:
+// Config + data dirs. One file, ~/.astra/config.json, env fallbacks:
 //   { "xai": {"key":"xai-…"}, "composio": {"apiKey":"ak_…"}, "box": {"token":"…"},
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
 import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { z } from "zod";
 import { normalizeImageGenerationUrl, type ImageGenerationConfig } from "../shared/image-generation.ts";
 
@@ -228,6 +228,14 @@ const featureConfigSchema = z.object({
   /** Experimental built-in browser. Off until explicitly enabled; each bot
    * also has its own switch. */
   browser: z.boolean().optional(),
+  /** Bots may propose edits to this server's own code, applied only through
+   * the journal + watchdog rollback path. Off until explicitly enabled —
+   * also settable with ASTRA_SELF_MODIFY=1. */
+  selfModify: z.boolean().optional(),
+  /** "Astra" wake word: keep an on-device Porcupine detector armed while
+   * the app runs. Off until explicitly enabled; the mic is not opened
+   * before that. */
+  wakeWord: z.boolean().optional(),
 });
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -303,6 +311,11 @@ const appConfigSchema = z.object({
   openaiCompat: z
     .object({ key: optionalText, url: optionalText, model: optionalText, provider: optionalText })
     .optional(),
+  /** Unified Vision engine (freellmapi proxy). `url` points at the proxy's
+   * OpenAI-compatible base; `model` seeds the default selection. */
+  vision: z
+    .object({ key: optionalText, url: optionalText, model: optionalText })
+    .optional(),
   /** Project key used for Sessions, catalog and agent tools. userId/sessionId
    * are non-secret local identifiers used to reuse one Composio Session. */
   composio: z.object({ apiKey: optionalText, userId: optionalText, sessionId: optionalText }).optional(),
@@ -313,7 +326,22 @@ const appConfigSchema = z.object({
   /** Voice credentials and the selected voice id. `provider` picks the
    * engine: "elevenlabs" (default; needs a key) or "system" (the Mac's
    * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["elevenlabs", "system"]).optional() }).optional(),
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["elevenlabs", "system", "piper"]).optional() }).optional(),
+  browser: z
+    .object({
+      chromePath: z
+        .string()
+        .max(500)
+        .refine((value) => value.trim().length > 0, { message: "chromePath must not be blank" })
+        .optional(),
+    })
+    .strict()
+    .optional(),
+  /** The "Astra" wake word: the Picovoice AccessKey for the renderer's
+   * on-device Porcupine detector. Stored and reported configured-or-not
+   * only; the key never leaves the server except to the user's own
+   * desktop shell. */
+  wakeWord: z.object({ accessKey: optionalText }).optional(),
   /** Avatar provider credentials stay separate; choosing a router never reuses a cloud key. */
   imageGen: z.object({
     provider: z.enum(["openai", "xai", "custom"]).optional(),
@@ -372,12 +400,17 @@ export interface AppConfig {
   budgets?: { monthlyUsd?: number; warnAtPercent?: number };
   billing?: { currency?: string; prices?: Record<string, { inputPerMillion: number; outputPerMillion: number; cachedInputPerMillion?: number }> };
   openaiCompat?: { key?: string; url?: string; model?: string; provider?: string };
+  vision?: { key?: string; url?: string; model?: string };
   composio?: { apiKey?: string; userId?: string; sessionId?: string };
   box?: { token?: string };
   /** A named host from the user's SSH config. Authentication stays with SSH. */
   vps?: { sshAlias?: string };
   opencodeGo?: { apiKey?: string };
-  tts?: { key?: string; voice?: string; provider?: "elevenlabs" | "system" };
+  tts?: { key?: string; voice?: string; provider?: "elevenlabs" | "system" | "piper" };
+  /** The bots' browser. Absent chromePath = Astra's own bundled Chrome;
+   * a path = the user's installed Chrome, in the bot's own profile. */
+  browser?: { chromePath?: string };
+  wakeWord?: { accessKey?: string };
   imageGen?: ImageGenerationConfig;
   profile?: { name?: string; email?: string };
   rooms?: { turnTimeoutMinutes: number };
@@ -386,7 +419,7 @@ export interface AppConfig {
    * separate container, durable workspace, viewer and lease. */
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean };
+  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; selfModify?: boolean; wakeWord?: boolean };
   /** First-run progress; see onboardingConfigSchema. */
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[] };
   /** Named browser sessions any bot can be pointed at. */
@@ -459,6 +492,20 @@ export interface BrowserProfilePartitionTarget {
   profileId: string;
   /** Exact Electron storage identity: view routing and cleanup use it. */
   partitionId: string;
+}
+
+/** Where the bots' Chrome comes from: the configured installed Chrome if it
+ *  exists, else Astra's own bundled/pinned one. A configured path that has
+ *  vanished (update, uninstall) fails soft to the managed browser — the bot
+ *  keeps working and Settings can say the path is stale. */
+export function botChromeExecutablePath(
+  config: Pick<AppConfig, "browser">,
+  options: { exists?: (path: string) => boolean; home?: string } = {},
+): { source: "configured" | "managed"; path?: string } {
+  const exists = options.exists ?? existsSync;
+  const configured = config.browser?.chromePath?.trim();
+  if (configured && exists(configured)) return { source: "configured", path: configured };
+  return { source: "managed" };
 }
 
 export function browserProfilePartitionTarget(
@@ -534,6 +581,14 @@ export function builtInBrowserEnabled(cfg: AppConfig): boolean {
   return cfg.features?.browser === true;
 }
 
+/** Opt-in ONLY: an explicit config flag or env var turns self-modification
+ * on. Default is off — the ability of a running server to rewrite its own
+ * source must never arrive silently with an update. */
+export function selfModifyEnabled(cfg: AppConfig): boolean {
+  if (process.env.ASTRA_SELF_MODIFY === "1") return true;
+  return cfg.features?.selfModify === true;
+}
+
 /** Config sections no provider driver reads. A write that touches only
  * these must not rebuild the fleet: rebuilding disposes every engine child
  * and reloads it, seconds of work that would also interrupt in-flight
@@ -543,6 +598,7 @@ export const FLEET_NEUTRAL_KEYS: ReadonlySet<string> = new Set([
   "profile",
   "language",
   "tts",
+  "wakeWord",
   "imageGen",
   "vps",
   "rooms",
@@ -558,24 +614,107 @@ export function providerReloadKeys(patch: object): string[] {
   return Object.keys(patch).filter((key) => !FLEET_NEUTRAL_KEYS.has(key));
 }
 
-// OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
-export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".openmausbot");
-const LEGACY_DATA_DIR = join(homedir(), ".opengrokbot");
+// ASTRA_DATA_DIR isolates test/soak rigs from the user's real fleet.
+// OMB_DATA_DIR is still read as a fallback so existing rigs keep working.
+const legacyDataDirOverride = process.env.OMB_DATA_DIR;
+export const DATA_DIR = process.env.ASTRA_DATA_DIR ?? legacyDataDirOverride ?? join(homedir(), ".astra");
+// Predecessors in order: OpenGrokBot (first release) and OpenMausBot (the
+// name this app shipped under until the Astra rename). A fresh machine has
+// neither.
+const LEGACY_DATA_DIRS = [join(homedir(), ".opengrokbot"), join(homedir(), ".openmausbot")];
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
 
 export function ensureDirs() {
   // one-time migration from the pre-rename data dir — bots, transcripts,
-  // config and keys all carry over
-  if (!existsSync(DATA_DIR) && existsSync(LEGACY_DATA_DIR)) {
-    try {
-      renameSync(LEGACY_DATA_DIR, DATA_DIR);
-    } catch {
-      /* cross-device or busy — fall through to a fresh dir */
+  // config and keys all carry over. Newest predecessor wins: a machine that
+  // ran both legacy versions renames the one it actually used last.
+  if (!existsSync(DATA_DIR)) {
+    const legacy = LEGACY_DATA_DIRS.find((dir) => existsSync(dir));
+    if (legacy) {
+      try {
+        renameSync(legacy, DATA_DIR);
+      } catch {
+        /* cross-device or busy — fall through to a fresh dir */
+      }
     }
   }
   for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
   migrateLegacyFeatureFlags();
+  migrateLegacyDataDirPaths();
+}
+
+/** A bot's `cwd` — and a room's — is captured when it is created rather than
+ * recomputed from DATA_DIR, and checkpoints realpath() it on every turn. The
+ * rename above moves the directory, so a stored string still names a path
+ * that no longer exists and the first turn dies with ENOENT. Rebase those
+ * stored paths once, before the store loads them. Idempotent: a tree with no
+ * retired prefix is left byte-for-byte alone. */
+function migrateLegacyDataDirPaths(): void {
+  const retired = LEGACY_DATA_DIRS.filter((dir) => dir !== DATA_DIR);
+  if (!retired.length) return;
+  for (const name of ["bots.json", "groups.json"]) {
+    const file = join(DATA_DIR, name);
+    if (!existsSync(file)) continue;
+    let stored: JsonValue;
+    try {
+      stored = parseJson(readFileSync(file, "utf8"));
+    } catch (error) {
+      // A store this app owns should always parse; a hand-edited one is left
+      // untouched and reported rather than overwritten.
+      console.error(`[config] ${name} unreadable for data-dir path migration: ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    const { value, changed } = rebaseRetiredDataDirPaths(stored, retired);
+    if (!changed) continue;
+    try {
+      writeFileAtomic(file, JSON.stringify(value, null, 2), { mode: 0o600 });
+      console.log(`[config] ${name}: rebased stored paths onto the renamed data dir`);
+    } catch (error) {
+      console.error(`[config] could not rebase paths in ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+/** The new location for a stored path that names a retired data dir, or null
+ * when the value is not one. Only a whole value counts: the old dir inside a
+ * bot's prose is the user's own text, not a path the app resolves. */
+export function rebaseRetiredDataDirPath(value: string, retired: readonly string[]): string | null {
+  const fold = (text: string) => (process.platform === "win32" ? text.toLowerCase() : text);
+  for (const dir of retired) {
+    const prefix = fold(dir);
+    const candidate = fold(value);
+    if (candidate === prefix) return DATA_DIR;
+    if (candidate.startsWith(`${prefix}${sep}`)) return join(DATA_DIR, value.slice(dir.length + 1));
+  }
+  return null;
+}
+
+function rebaseRetiredDataDirPaths(node: JsonValue, retired: readonly string[]): { value: JsonValue; changed: boolean } {
+  if (typeof node === "string") {
+    const rebased = rebaseRetiredDataDirPath(node, retired);
+    return rebased === null ? { value: node, changed: false } : { value: rebased, changed: true };
+  }
+  if (Array.isArray(node)) {
+    let changed = false;
+    const value = node.map((item) => {
+      const next = rebaseRetiredDataDirPaths(item, retired);
+      changed ||= next.changed;
+      return next.value;
+    });
+    return { value, changed };
+  }
+  if (node && typeof node === "object") {
+    let changed = false;
+    const value: JsonObject = {};
+    for (const [key, item] of Object.entries(node)) {
+      const next = rebaseRetiredDataDirPaths(item, retired);
+      changed ||= next.changed;
+      value[key] = next.value;
+    }
+    return { value, changed };
+  }
+  return { value: node, changed: false };
 }
 
 /** `features.skillRecorder` became `features.skillAuthoring` when the Teach a
@@ -625,13 +764,17 @@ export function loadConfig(): AppConfig {
   // never the workspace key, so an operator's stray variable cannot flip
   // every Claude bot onto pay-as-you-go billing.
   cfg.anthropic = { ...cfg.anthropic };
-  if (process.env.OMB_ANTHROPIC_API_KEY !== undefined) cfg.anthropic.key = process.env.OMB_ANTHROPIC_API_KEY;
-  if (process.env.OMB_ANTHROPIC_API_URL !== undefined) cfg.anthropic.url = process.env.OMB_ANTHROPIC_API_URL;
+  if (process.env.ASTRA_ANTHROPIC_API_KEY !== undefined) cfg.anthropic.key = process.env.ASTRA_ANTHROPIC_API_KEY;
+  if (process.env.ASTRA_ANTHROPIC_API_URL !== undefined) cfg.anthropic.url = process.env.ASTRA_ANTHROPIC_API_URL;
   cfg.openaiCompat = { ...cfg.openaiCompat };
   if (process.env.OPENAI_COMPAT_API_KEY !== undefined) cfg.openaiCompat.key = process.env.OPENAI_COMPAT_API_KEY;
   if (process.env.OPENAI_COMPAT_URL !== undefined) cfg.openaiCompat.url = process.env.OPENAI_COMPAT_URL;
   if (process.env.OPENAI_COMPAT_MODEL !== undefined) cfg.openaiCompat.model = process.env.OPENAI_COMPAT_MODEL;
   if (process.env.OPENAI_COMPAT_PROVIDER !== undefined) cfg.openaiCompat.provider = process.env.OPENAI_COMPAT_PROVIDER;
+  cfg.vision = { ...cfg.vision };
+  if (process.env.FREELLMAPI_API_KEY !== undefined) cfg.vision.key = process.env.FREELLMAPI_API_KEY;
+  if (process.env.VISION_URL !== undefined) cfg.vision.url = process.env.VISION_URL;
+  if (process.env.VISION_MODEL !== undefined) cfg.vision.model = process.env.VISION_MODEL;
   cfg.composio = { ...cfg.composio };
   if (process.env.COMPOSIO_API_KEY !== undefined) cfg.composio.apiKey = process.env.COMPOSIO_API_KEY;
   cfg.box = { ...cfg.box };
@@ -639,17 +782,19 @@ export function loadConfig(): AppConfig {
   cfg.opencodeGo = { ...cfg.opencodeGo };
   if (process.env.OPENCODE_API_KEY !== undefined) cfg.opencodeGo.apiKey = process.env.OPENCODE_API_KEY;
   cfg.tts = { ...cfg.tts };
-  if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  if (process.env.ASTRA_TTS_KEY !== undefined) cfg.tts.key = process.env.ASTRA_TTS_KEY;
+  cfg.wakeWord = { ...cfg.wakeWord };
+  if (process.env.ASTRA_PICOVOICE_KEY !== undefined) cfg.wakeWord.accessKey = process.env.ASTRA_PICOVOICE_KEY;
   cfg.imageGen = { ...cfg.imageGen };
-  if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
-  if (process.env.OMB_CUSTOM_IMAGE_KEY !== undefined) cfg.imageGen.customApiKey = process.env.OMB_CUSTOM_IMAGE_KEY;
+  if (process.env.ASTRA_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.ASTRA_OPENAI_IMAGE_KEY;
+  if (process.env.ASTRA_CUSTOM_IMAGE_KEY !== undefined) cfg.imageGen.customApiKey = process.env.ASTRA_CUSTOM_IMAGE_KEY;
   // The sign-in allow-list: env is how a headless box or a container is
   // bootstrapped before anyone can reach Settings.
   const splitEmails = (value: string) => value.split(/[,\s]+/).map((entry) => entry.trim().toLowerCase()).filter(Boolean);
-  if (process.env.OMB_SIGNIN_EMAILS !== undefined || process.env.OMB_SIGNIN_MEMBER_EMAILS !== undefined) {
+  if (process.env.ASTRA_SIGNIN_EMAILS !== undefined || process.env.ASTRA_SIGNIN_MEMBER_EMAILS !== undefined) {
     cfg.signIn = { ...cfg.signIn };
-    if (process.env.OMB_SIGNIN_EMAILS !== undefined) cfg.signIn.admins = splitEmails(process.env.OMB_SIGNIN_EMAILS);
-    if (process.env.OMB_SIGNIN_MEMBER_EMAILS !== undefined) cfg.signIn.members = splitEmails(process.env.OMB_SIGNIN_MEMBER_EMAILS);
+    if (process.env.ASTRA_SIGNIN_EMAILS !== undefined) cfg.signIn.admins = splitEmails(process.env.ASTRA_SIGNIN_EMAILS);
+    if (process.env.ASTRA_SIGNIN_MEMBER_EMAILS !== undefined) cfg.signIn.members = splitEmails(process.env.ASTRA_SIGNIN_MEMBER_EMAILS);
   }
   return cfg;
 }
@@ -664,14 +809,16 @@ export function loadConfig(): AppConfig {
 export function syncCredentialEnv(patch: Partial<AppConfig>): void {
   const secrets: Array<[value: string | undefined, name: string]> = [
     [patch.xai?.key, "XAI_API_KEY"],
-    [patch.anthropic?.key, "OMB_ANTHROPIC_API_KEY"],
+    [patch.anthropic?.key, "ASTRA_ANTHROPIC_API_KEY"],
     [patch.openaiCompat?.key, "OPENAI_COMPAT_API_KEY"],
+    [patch.vision?.key, "FREELLMAPI_API_KEY"],
     [patch.composio?.apiKey, "COMPOSIO_API_KEY"],
     [patch.box?.token, "BOX_TOKEN"],
     [patch.opencodeGo?.apiKey, "OPENCODE_API_KEY"],
-    [patch.tts?.key, "OMB_TTS_KEY"],
-    [patch.imageGen?.key, "OMB_OPENAI_IMAGE_KEY"],
-    [patch.imageGen?.customApiKey, "OMB_CUSTOM_IMAGE_KEY"],
+    [patch.tts?.key, "ASTRA_TTS_KEY"],
+    [patch.wakeWord?.accessKey, "ASTRA_PICOVOICE_KEY"],
+    [patch.imageGen?.key, "ASTRA_OPENAI_IMAGE_KEY"],
+    [patch.imageGen?.customApiKey, "ASTRA_CUSTOM_IMAGE_KEY"],
   ];
   for (const [value, name] of secrets) {
     if (value === undefined) continue;
@@ -682,9 +829,11 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
   // must follow the same set-when-truthy / delete-when-cleared rule as keys.
   const settings: Array<[value: string | undefined, name: string]> = [
     [patch.openaiCompat?.url, "OPENAI_COMPAT_URL"],
-    [patch.anthropic?.url, "OMB_ANTHROPIC_API_URL"],
+    [patch.anthropic?.url, "ASTRA_ANTHROPIC_API_URL"],
     [patch.openaiCompat?.model, "OPENAI_COMPAT_MODEL"],
     [patch.openaiCompat?.provider, "OPENAI_COMPAT_PROVIDER"],
+    [patch.vision?.url, "VISION_URL"],
+    [patch.vision?.model, "VISION_MODEL"],
   ];
   for (const [value, name] of settings) {
     if (value === undefined) continue;
@@ -700,22 +849,27 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
  * child these are someone else's keys riding along in `...process.env`. */
 export const WORKSPACE_CREDENTIAL_ENV = [
   "XAI_API_KEY",
-  "OMB_ANTHROPIC_API_KEY",
-  "OMB_ANTHROPIC_API_URL",
+  "ASTRA_ANTHROPIC_API_KEY",
+  "ASTRA_ANTHROPIC_API_URL",
   "OPENAI_COMPAT_API_KEY",
   "OPENAI_COMPAT_URL",
+  "FREELLMAPI_API_KEY",
+  "VISION_URL",
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
-  "OMB_TTS_KEY",
-  "OMB_OPENAI_IMAGE_KEY",
-  "OMB_CUSTOM_IMAGE_KEY",
+  "ASTRA_TTS_KEY",
+  // Legacy Deepgram secret: no longer consumed, but must not leak to children.
+  "ASTRA_DICTATION_KEY",
+  "ASTRA_PICOVOICE_KEY",
+  "ASTRA_OPENAI_IMAGE_KEY",
+  "ASTRA_CUSTOM_IMAGE_KEY",
   "COMPOSIO_API_KEY",
-  "OMB_COMPOSIO_BROKER_TOKEN",
+  "ASTRA_COMPOSIO_BROKER_TOKEN",
   // Harness-private filesystem hints are not credentials themselves, but
   // exposing them to a shell-capable agent points straight at app-owned
   // state. The built-in browser master is delivered privately in memory.
-  "OMB_BROWSER_CONNECTION",
-  "OMB_USER_DATA",
+  "ASTRA_BROWSER_CONNECTION",
+  "ASTRA_USER_DATA",
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */
@@ -742,7 +896,7 @@ export const PROVIDER_CREDENTIAL_ENV = [
   "CURSOR_AUTH_TOKEN",
 ] as const;
 
-/** Merge a partial config into ~/.openmausbot/config.json (secrets never
+/** Merge a partial config into ~/.astra/config.json (secrets never
  * echoed back — callers report configured-or-not booleans only). */
 export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstances?: boolean } = {}): void {
   const p = join(DATA_DIR, "config.json");
@@ -759,7 +913,7 @@ export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstance
   // back after we have successfully recognized the legacy list.
   const storedProfiles = storedBrowserProfilesSchema.safeParse(disk.browserProfiles);
   if (storedProfiles.success) disk.browserProfiles = storedProfiles.data;
-  for (const key of ["xai", "anthropic", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "localVm", "features", "budgets", "billing", "onboarding"] as const) {
+  for (const key of ["xai", "anthropic", "openaiCompat", "vision", "composio", "box", "opencodeGo", "tts", "wakeWord", "imageGen", "profile", "rooms", "threads", "localVm", "features", "budgets", "billing", "onboarding"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -895,6 +1049,8 @@ function injectedEnvironment(cfg: AppConfig, driver: string): Map<string, string
     environment.set("OPENAI_COMPAT_API_KEY", cfg.openaiCompat.key);
   if (driver === "openai-compat" && cfg.openaiCompat?.url)
     environment.set("OPENAI_COMPAT_URL", cfg.openaiCompat.url);
+  if (driver === "vision" && cfg.vision?.key) environment.set("FREELLMAPI_API_KEY", cfg.vision.key);
+  if (driver === "vision" && cfg.vision?.url) environment.set("VISION_URL", cfg.vision.url);
   if (driver === "boxAgent" && cfg.box?.token) environment.set("BOX_TOKEN", cfg.box.token);
   if (driver === "opencodeGo" && cfg.opencodeGo?.apiKey) environment.set("OPENCODE_API_KEY", cfg.opencodeGo.apiKey);
   return environment;
@@ -921,6 +1077,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   // The driver stays registered for enterprise licences, which keep Gemini
   // CLI — `{"instances": {"gemini": {"driver": "geminiAgent"}}}` restores it.
   const DEFAULT_FLEET: InstanceConfigMap = {
+    vision: { driver: "vision" },
     grok: { driver: "grokAgent" },
     kimi: { driver: "kimiAgent" },
     droid: { driver: "droidAgent" },
@@ -946,6 +1103,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   const PRODUCT_FLEET_ADDITIONS = {
     cursor: { driver: "cursorAgent" },
     openaiCompat: { driver: "openai-compat" },
+    vision: { driver: "vision" },
     ...CUSTOM_ONLY,
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;
@@ -988,6 +1146,24 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
           // Empty routing explicitly means "no upstream pin" for isolated
           // API connections. Do not replace it with a workspace provider.
           if (k === "provider" && typeof merged[k] === "string") continue;
+          if (typeof merged[k] !== "string" || !(merged[k] as string).trim()) merged[k] = v;
+        }
+        entry.config = merged;
+      }
+    }
+    // Same workspace-default layering for the unified Vision engine. A
+    // per-instance value always wins; the driver's decodeConfig keeps its own
+    // localhost defaults when neither layer supplies a URL.
+    if (entry.driver === "vision" && cfg.vision) {
+      const defaults: Record<string, string> = {};
+      if (cfg.vision.url) defaults.url = cfg.vision.url;
+      if (cfg.vision.model) defaults.model = cfg.vision.model;
+      if (Object.keys(defaults).length) {
+        const raw = entry.config;
+        const current =
+          typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+        const merged = { ...current };
+        for (const [k, v] of Object.entries(defaults)) {
           if (typeof merged[k] !== "string" || !(merged[k] as string).trim()) merged[k] = v;
         }
         entry.config = merged;
